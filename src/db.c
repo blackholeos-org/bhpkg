@@ -256,7 +256,7 @@ db_fetch_manifest (const char *name, const char *target_version)
   while (sqlite3_step (stmt) == SQLITE_ROW)
     {
       const char *row_ver = (const char *) sqlite3_column_text (stmt, 0);
-      if (!best_ver || strverscmp (row_ver, best_ver) > 0)
+      if (!best_ver || bhpkg_vercmp (row_ver, best_ver) > 0)
         {
           if (best_ver) free (best_ver);
           best_ver = xstrdup (row_ver);
@@ -314,6 +314,11 @@ db_fetch_manifest (const char *name, const char *target_version)
           parsed_pkg->post_install = post_in ? xstrdup (post_in) : xstrdup ("");
           parsed_pkg->pre_remove = pre_rm ? xstrdup (pre_rm) : xstrdup ("");
           parsed_pkg->post_remove = post_rm ? xstrdup (post_rm) : xstrdup ("");
+          
+          /* Future compatibility logic / default initializers */
+          parsed_pkg->net_access = false;
+          parsed_pkg->is_delta = false;
+          
           parsed_pkg->install_reason = 1;
           parsed_pkg->state = STATE_UNVISITED;
         }
@@ -524,7 +529,9 @@ db_remove_package (const char *name)
   print_msg ("Removing package %s...", name);
   
   if (pkg && pkg->pre_remove && strlen (pkg->pre_remove) > 0)
-    run_hook (pkg->pre_remove, "pre_remove");
+    run_hook_script (pkg->pre_remove, "pre_remove");
+
+  hook_execute_all ("Remove");
 
   if (sqlite3_prepare_v2 (db, "SELECT filepath, hash, is_config FROM files WHERE package = ? ORDER BY filepath DESC", -1, &stmt, NULL) == SQLITE_OK)
     {
@@ -594,7 +601,7 @@ db_remove_package (const char *name)
   sqlite3_exec (db, "COMMIT;", 0, 0, 0);
 
   if (pkg && pkg->post_remove && strlen (pkg->post_remove) > 0)
-    run_hook (pkg->post_remove, "post_remove");
+    run_hook_script (pkg->post_remove, "post_remove");
 
   print_msg ("Package %s removed cleanly.", name);
   return true;
@@ -718,7 +725,7 @@ db_get_updates (BuildList *updates)
       const char *local_ver = (const char *) sqlite3_column_text (stmt, 1);
       const char *remote_ver = (const char *) sqlite3_column_text (stmt, 2);
 
-      if (strverscmp (remote_ver, local_ver) > 0)
+      if (bhpkg_vercmp (remote_ver, local_ver) > 0)
         {
           Package *pkg = db_fetch_manifest (name, NULL);
           if (pkg)
@@ -778,6 +785,44 @@ db_get_file_hash (const char *filepath, char *hash_out)
       sqlite3_finalize (stmt);
     }
   return found;
+}
+
+void
+db_reconstruct_to_staging (const char *pkg_name, const char *staging_dir)
+{
+  sqlite3_stmt *stmt;
+  const char *sql = "SELECT filepath FROM files WHERE package = ?";
+  
+  if (sqlite3_prepare_v2 (db, sql, -1, &stmt, NULL) == SQLITE_OK)
+    {
+      sqlite3_bind_text (stmt, 1, pkg_name, -1, SQLITE_TRANSIENT);
+      while (sqlite3_step (stmt) == SQLITE_ROW)
+        {
+          const char *file = (const char *) sqlite3_column_text (stmt, 0);
+          if (file)
+            {
+              char target[PATH_MAX];
+              snprintf (target, sizeof (target), "%s%s", staging_dir, file);
+              
+              /* Ensure intermediate directories exist locally for the hardlink */
+              char tmp[PATH_MAX];
+              snprintf (tmp, sizeof (tmp), "%s", target);
+              for (char *p = tmp + 1; *p; p++)
+                {
+                  if (*p == '/')
+                    {
+                      *p = '\0';
+                      mkdir (tmp, 0755);
+                      *p = '/';
+                    }
+                }
+              
+              /* Hardlink to save space and I/O time while preventing modification of base file */
+              link (file, target);
+            }
+        }
+      sqlite3_finalize (stmt);
+    }
 }
 
 void

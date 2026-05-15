@@ -48,9 +48,9 @@ rollback_written_files (void)
       struct stat st;
       if (lstat (path, &st) == 0)
         {
-          if (S_ISDIR (st.st_mode))
+          if (S_ISDIR (st.st_mode)) 
             rmdir (path);
-          else
+          else 
             unlink (path);
         }
       free (g_written_files[i - 1]);
@@ -63,23 +63,24 @@ rollback_written_files (void)
 }
 
 void
-run_hook (const char *script_body, const char *hook_name)
+run_hook_script (const char *script_body, const char *hook_name)
 {
   char path[] = "/var/lib/bhpkg/tmp/hook_XXXXXX";
   int fd;
   char *const args[] = { path, NULL };
 
-  if (!script_body || strlen (script_body) == 0)
-    return;
+  if (!script_body || strlen (script_body) == 0) return;
 
   fd = mkstemp (path);
-  if (fd < 0)
+  if (fd < 0) 
     return;
 
   fchmod (fd, 0700);
   dprintf (fd, "#!/bin/sh\n%s\n", script_body);
   close (fd);
 
+  if (g_verbosity > 0) 
+    print_msg ("Executing %s script...", hook_name);
   safe_exec (args);
   unlink (path);
 }
@@ -104,9 +105,14 @@ ensure_parent_dir (const char *path)
 }
 
 static void
-enter_hermetic_sandbox (const char *builddir, const char *fakeroot)
+enter_hermetic_sandbox (const char *builddir, const char *fakeroot, bool net_access)
 {
-  if (unshare (CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID) < 0)
+  int unshare_flags = CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWPID;
+
+  if (!net_access)
+    unshare_flags |= CLONE_NEWNET;
+
+  if (unshare (unshare_flags) < 0)
     exit (127);
 
   pid_t child_pid = fork ();
@@ -128,6 +134,24 @@ enter_hermetic_sandbox (const char *builddir, const char *fakeroot)
   mkdir ("/tmp/sandbox/usr", 0755);
   mkdir ("/tmp/sandbox/lib", 0755);
   mkdir ("/tmp/sandbox/etc", 0755);
+  
+  if (net_access)
+    {
+      mkdir ("/tmp/sandbox/etc/ssl", 0755);
+      if (access ("/etc/ssl", F_OK) == 0)
+        {
+          mount ("/etc/ssl", "/tmp/sandbox/etc/ssl", NULL, MS_BIND | MS_REC, NULL);
+          mount ("none", "/tmp/sandbox/etc/ssl", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_REC, NULL);
+        }
+      
+      FILE *f = fopen ("/tmp/sandbox/etc/resolv.conf", "w");
+      if (f) 
+        { 
+          fprintf (f, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"); 
+          fclose (f); 
+        }
+    }
+
   mkdir ("/tmp/sandbox/dev", 0755);
   mkdir ("/tmp/sandbox/proc", 0755);
   mkdir ("/tmp/sandbox/sys", 0755);
@@ -188,28 +212,66 @@ enter_hermetic_sandbox (const char *builddir, const char *fakeroot)
     exit (127);
 }
 
+static void
+move_to_subpackage (const char *src_dir, const char *dst_dir, const char *pattern)
+{
+  char cmd[PATH_MAX * 3];
+  snprintf (cmd, sizeof(cmd), 
+            "mkdir -p %s && cd %s && find . -path '%s' -exec cp --parents -a {} %s/ \\; -exec rm -rf {} \\; 2>/dev/null",
+            dst_dir, src_dir, pattern, dst_dir);
+  system (cmd);
+}
+
+void
+split_subpackages (Package *pkg, const char *fakeroot)
+{
+  char root_doc[PATH_MAX];
+  char arc_doc[PATH_MAX];
+  
+  snprintf (root_doc, sizeof (root_doc), "%s-doc", fakeroot);
+  mkdir (root_doc, 0755);
+
+  move_to_subpackage (fakeroot, root_doc, "./usr/share/man/*");
+  move_to_subpackage (fakeroot, root_doc, "./usr/share/doc/*");
+  move_to_subpackage (fakeroot, root_doc, "./usr/share/info/*");
+
+  struct stat st;
+  if (stat (root_doc, &st) == 0 && st.st_nlink > 2)
+    {
+      snprintf (arc_doc, sizeof (arc_doc), "/var/cache/bhpkg/%s-doc-%s.tar.zst", pkg->name, pkg->version);
+      archive_compress (root_doc, arc_doc);
+      if (g_verbosity > 0) print_msg ("Created subpackage %s-doc", pkg->name);
+    }
+}
+
 bool
 build_package (Package *pkg)
 {
   char arc[PATH_MAX], scr[PATH_MAX];
-  char *const c_clean[] = { "rm", "-rf", g_builddir, g_fakeroot, NULL };
+  char root_dev[PATH_MAX], root_doc[PATH_MAX];
   int fd_scr;
   pid_t pid;
   int status;
 
   snprintf (g_builddir, sizeof (g_builddir), "/var/lib/bhpkg/tmp/build-%s-XXXXXX", pkg->name);
   snprintf (g_fakeroot, sizeof (g_fakeroot), "/var/lib/bhpkg/tmp/pkg-%s-XXXXXX", pkg->name);
+  
+  snprintf (root_dev, sizeof (root_dev), "%s-dev", g_fakeroot);
+  snprintf (root_doc, sizeof (root_doc), "%s-doc", g_fakeroot);
+  
+  char *const c_clean[] = { "rm", "-rf", g_builddir, g_fakeroot, root_dev, root_doc, NULL };
+
   snprintf (arc, sizeof (arc), "/var/cache/bhpkg/%s-%s.tar.zst", pkg->name, pkg->version);
 
-  if (!mkdtemp (g_builddir) || !mkdtemp (g_fakeroot))
+  if (!mkdtemp (g_builddir) || !mkdtemp (g_fakeroot)) 
     return false;
 
   for (size_t i = 0; i < pkg->num_sources; i++)
     {
       char host_src[PATH_MAX], staged[PATH_MAX];
-      snprintf (host_src, sizeof (host_src), "/var/lib/bhpkg/tmp/%s-%s-%zu.src",
+      snprintf (host_src, sizeof (host_src), "/var/lib/bhpkg/tmp/%s-%s-%zu.src", 
                 pkg->name, pkg->version, i);
-      snprintf (staged, sizeof (staged), "%s/%s-%s-%zu.src",
+      snprintf (staged, sizeof (staged), "%s/%s-%s-%zu.src", 
                 g_builddir, pkg->name, pkg->version, i);
       if (!zero_copy_file (host_src, staged, 0644))
         {
@@ -234,7 +296,7 @@ build_package (Package *pkg)
 
   snprintf (scr, sizeof (scr), "%s/bh-build.sh", g_builddir);
   fd_scr = open (scr, O_CREAT | O_WRONLY | O_TRUNC, 0755);
-  if (fd_scr < 0)
+  if (fd_scr < 0) 
     return false;
   
   fchmod (fd_scr, 0755);
@@ -267,18 +329,18 @@ build_package (Package *pkg)
             }
         }
 
-      enter_hermetic_sandbox (g_builddir, g_fakeroot);
+      enter_hermetic_sandbox (g_builddir, g_fakeroot, pkg->net_access);
 
       for (size_t i = 0; i < pkg->num_sources; i++)
         {
           char src[PATH_MAX];
-          snprintf (src, sizeof (src), "/build/%s-%s-%zu.src",
+          snprintf (src, sizeof (src), "/build/%s-%s-%zu.src", 
                     pkg->name, pkg->version, i);
 
-          if (strstr (pkg->sources[i], ".tar") || strstr (pkg->sources[i], ".tgz")
+          if (strstr (pkg->sources[i], ".tar") || strstr (pkg->sources[i], ".tgz") 
               || strstr (pkg->sources[i], ".txz"))
             {
-              if (!archive_extract (src,
+              if (!archive_extract (src, 
                     strcmp (pkg->type, "binary") == 0 ? "/dest" : "/build", 1))
                 exit (1);
             }
@@ -307,7 +369,7 @@ build_package (Package *pkg)
           spin_idx = (spin_idx + 1) % 4;
         }
         
-      if (g_verbosity == 1)
+      if (g_verbosity == 1) 
         printf ("\r\033[K\033[?25h");
     }
   else
@@ -322,13 +384,41 @@ build_package (Package *pkg)
       return false;
     }
 
-  if (!archive_compress (g_fakeroot, arc))
+  split_subpackages (pkg, g_fakeroot);
+
+  if (!archive_compress (g_fakeroot, arc)) 
     return false;
 
   safe_exec (c_clean);
   pkg->is_cached = true;
   sync ();
   return true;
+}
+
+void
+apply_delta_rm_manifest (const char *staging_dir)
+{
+  char manifest[PATH_MAX];
+  FILE *f;
+  char line[PATH_MAX];
+
+  snprintf (manifest, sizeof (manifest), "%s/.bhpkg-rm", staging_dir);
+  f = fopen (manifest, "re");
+  if (!f) return;
+
+  while (fgets (line, sizeof (line), f))
+    {
+      line[strcspn (line, "\r\n")] = '\0';
+      if (strlen (line) == 0) continue;
+
+      char target[PATH_MAX * 2];
+      snprintf (target, sizeof (target), "%s/%s", staging_dir, line);
+      
+      unlink (target);
+      rmdir (target); 
+    }
+  fclose (f);
+  unlink (manifest);
 }
 
 static int
@@ -345,12 +435,12 @@ install_cb (const char *fpath, const struct stat *sb, int typeflag, struct FTW *
       return -1;
     }
 
-  if (typeflag != FTW_F && typeflag != FTW_D && typeflag != FTW_SL)
+  if (typeflag != FTW_F && typeflag != FTW_D && typeflag != FTW_SL) 
     return 0;
 
   rel_target = fpath + strlen (g_staging);
-  
-  if (*rel_target == '\0' || strstr (rel_target, "/../") != NULL)
+
+  if (*rel_target == '\0' || strstr (rel_target, "/../") != NULL) 
     return 0;
 
   snprintf (target, sizeof (target), "%s", rel_target);
@@ -358,7 +448,7 @@ install_cb (const char *fpath, const struct stat *sb, int typeflag, struct FTW *
 
   if (typeflag == FTW_D)
     {
-      if (mkdir (target, sb->st_mode) == 0)
+      if (mkdir (target, sb->st_mode) == 0) 
         track_written_file (target);
       return 0;
     }
@@ -378,13 +468,13 @@ install_cb (const char *fpath, const struct stat *sb, int typeflag, struct FTW *
 
       if (!db_get_file_hash (target, db_hash) && strncmp (target, "/etc/", 5) != 0)
         {
-          if (S_ISLNK (existing_st.st_mode) ||
+          if (S_ISLNK (existing_st.st_mode) || 
               strncmp (target, "/usr/", 5) == 0 || strncmp (target, "/bin/", 5) == 0 || 
               strncmp (target, "/lib/", 5) == 0 || strncmp (target, "/sbin/", 6) == 0 ||
               strncmp (target, "/libexec/", 9) == 0 || strncmp (target, "/include/", 9) == 0 ||
               strncmp (target, "/x86_64-linux-musl", 18) == 0)
             {
-              if (g_verbosity >= 3)
+              if (g_verbosity >= 3) 
                 print_warn ("Adopting untracked file/symlink: %s", target);
             }
           else
@@ -445,7 +535,7 @@ install_cb (const char *fpath, const struct stat *sb, int typeflag, struct FTW *
     
   if (chown (target, 0, 0) != 0)
     {
-      if (g_verbosity >= 3)
+      if (g_verbosity >= 3) 
         print_warn ("Failed to chown %s to root:root (errno: %d)", target, errno);
     }
     
@@ -465,17 +555,26 @@ install_artifact (Package *pkg)
   g_current_pkg = pkg;
   g_install_failed = false;
 
-  if (!mkdtemp (g_staging))
+  if (!mkdtemp (g_staging)) 
     return false;
+
+  if (pkg->is_delta)
+    {
+      if (g_verbosity > 0) print_msg ("Applying binary Delta patch to staging layer...");
+      db_reconstruct_to_staging (pkg->name, g_staging);
+    }
 
   if (!archive_extract (arc, g_staging, 0))
     {
-      print_err ("Failed to extract cached archive for installation.");
+      print_err ("Failed to extract cached artifact.");
       safe_exec (c_clean);
       return false;
     }
 
-  run_hook (pkg->pre_install, "pre_install");
+  if (pkg->is_delta)
+    apply_delta_rm_manifest (g_staging);
+
+  run_hook_script (pkg->pre_install, "pre_install");
   
   nftw (g_staging, install_cb, 20, FTW_PHYS);
 
@@ -486,8 +585,6 @@ install_artifact (Package *pkg)
       safe_exec (c_clean);
       return false;
     }
-
-  run_hook (pkg->post_install, "post_install");
 
   db_register_package (pkg, g_staging);
   
@@ -501,6 +598,10 @@ install_artifact (Package *pkg)
     }
 
   safe_exec (c_clean);
+  
+  hook_execute_all ("Install");
+  run_hook_script (pkg->post_install, "post_install");
+
   sync ();
   return true;
 }

@@ -135,6 +135,7 @@ net_download_all (BuildList *list)
           
           printf ("\r%s==>%s Fetching %zu sources... [", C_CYN, C_RST, total_downloads);
           
+          /* I Love Candy ;) */
           if (g_pacman_mode)
             {
               for (int j = 0; j < bar_width; j++)
