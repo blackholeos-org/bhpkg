@@ -157,12 +157,18 @@ zero_copy_file (const char *src, const char *dst, mode_t mode)
             break;
           len -= bytes_read;
         }
+      else if (ret == 0)
+        {
+          break;
+        }
       else
         {
           len -= ret;
         }
     }
     
+  fsync (fd_out);
+  
   close (fd_in);
   close (fd_out);
   return true;

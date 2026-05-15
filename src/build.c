@@ -327,6 +327,7 @@ build_package (Package *pkg)
 
   safe_exec (c_clean);
   pkg->is_cached = true;
+  sync ();
   return true;
 }
 
@@ -500,5 +501,6 @@ install_artifact (Package *pkg)
     }
 
   safe_exec (c_clean);
+  sync ();
   return true;
 }
