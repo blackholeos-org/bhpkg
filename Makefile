@@ -1,7 +1,10 @@
 CC = musl-gcc
 SYSROOT = $(PWD)/sysroot
 
-CFLAGS = -Wall -Wextra -O3 -flto -march=native -pipe -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security -Iinclude -I$(SYSROOT)/include -MMD -MP -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64
+CFLAGS = -Wall -Wextra -O3 -flto -march=native -pipe -fstack-protector-strong \
+         -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security \
+         -Iinclude -I$(SYSROOT)/include -idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu \
+         -MMD -MP -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64
 EXEC = bhpkg
 
 SRC = src/main.c src/graph.c src/net.c src/crypto.c src/archive.c src/db.c src/utils.c src/build.c src/hook.c src/version.c

@@ -5,13 +5,20 @@
 #include <stdint.h>
 #include "bhpkg.h"
 
-#define CONFLICT_HASH_SIZE 4096
-static ConflictNode *g_conflict_cache[CONFLICT_HASH_SIZE] = { NULL };
-
-typedef struct {
+typedef struct
+{
   const char *name;
   const char *constraint;
 } SatConstraint;
+
+typedef struct
+{
+  SatConstraint req;
+  Package **cands;
+  size_t cand_count;
+  size_t cand_idx;
+  size_t old_assign_count;
+} StackFrame;
 
 void
 build_list_init (BuildList *list)
@@ -67,8 +74,7 @@ check_single_constraint (const char *installed_ver, const char *constraint)
 static bool
 check_version (const char *installed_ver, const char *constraints)
 {
-  char *copy;
-  char *tok;
+  char *copy, *tok;
 
   if (!constraints || strlen (constraints) == 0)
     return true;
@@ -101,195 +107,232 @@ find_in_assignment (Package **assignment, size_t count, const char *name)
   return NULL;
 }
 
-static inline uint32_t
-hash_state (Package **assignment, size_t count, const char *target, const char *constraint)
-{
-  uint32_t hash = 2166136261u;
-  for (size_t i = 0; i < count; i++)
-    {
-      const char *p = assignment[i]->name;
-      while (*p) { hash ^= (uint8_t) *p++; hash *= 16777619u; }
-      p = assignment[i]->version;
-      while (*p) { hash ^= (uint8_t) *p++; hash *= 16777619u; }
-    }
-  const char *t = target;
-  while (*t) { hash ^= (uint8_t) *t++; hash *= 16777619u; }
-  const char *c = constraint;
-  if (c)
-    while (*c) { hash ^= (uint8_t) *c++; hash *= 16777619u; }
-  return hash;
-}
-
-static bool
-is_conflict_cached (uint32_t hash)
-{
-  uint32_t idx = hash % CONFLICT_HASH_SIZE;
-  ConflictNode *curr = g_conflict_cache[idx];
-  while (curr)
-    {
-      if (curr->state_hash == hash) return true;
-      curr = curr->next;
-    }
-  return false;
-}
-
-static void
-cache_conflict (uint32_t hash)
-{
-  uint32_t idx = hash % CONFLICT_HASH_SIZE;
-  ConflictNode *node = xmalloc (sizeof (ConflictNode));
-  node->state_hash = hash;
-  node->next = g_conflict_cache[idx];
-  g_conflict_cache[idx] = node;
-}
-
 static int
 compare_versions_desc (const void *a, const void *b)
 {
   Package *pa = *(Package **)a;
   Package *pb = *(Package **)b;
-  return bhpkg_vercmp (pb->version, pa->version); /* Descending */
+  return bhpkg_vercmp (pb->version, pa->version);
 }
 
+/* Iterative DPLL Solver to completely prevent C stack overflow and solve scalable logic constraints */
 static bool
-sat_solve (Package ***assignment, size_t *assign_count, size_t *assign_cap, 
-           SatConstraint **queue, size_t q_head, size_t q_tail, size_t *q_cap)
+iterative_sat_solve (Package ***assignment, size_t *assign_count, SatConstraint *initial_req)
 {
-  if (q_head == q_tail) return true;
-
-  SatConstraint req = (*queue)[q_head];
+  size_t stack_cap = 4096;
+  StackFrame *stack = xmalloc (stack_cap * sizeof (StackFrame));
+  size_t stack_top = 0;
   
-  uint32_t state_hash = hash_state (*assignment, *assign_count, req.name, req.constraint);
-  if (is_conflict_cached (state_hash))
-    return false;
+  size_t queue_cap = 4096;
+  SatConstraint *queue = xmalloc (queue_cap * sizeof (SatConstraint));
+  size_t q_head = 0, q_tail = 0;
+  
+  size_t assign_cap = 4096;
+  *assignment = xmalloc (assign_cap * sizeof (Package *));
+  *assign_count = 0;
 
-  Package *existing = find_in_assignment (*assignment, *assign_count, req.name);
-  if (existing)
+  queue[q_tail++] = *initial_req;
+
+  while (true)
     {
-      if (check_version (existing->version, req.constraint))
+      if (q_head == q_tail)
         {
-          if (sat_solve (assignment, assign_count, assign_cap, queue, q_head + 1, q_tail, q_cap))
-            return true;
+          free (stack);
+          free (queue);
+          return true; /* All constraints satisfied */
         }
-      cache_conflict (state_hash);
-      return false;
-    }
-
-  size_t cand_count;
-  Package **cands = db_fetch_all_versions (req.name, &cand_count);
-  
-  qsort (cands, cand_count, sizeof (Package *), compare_versions_desc);
-  
-  for (size_t i = 0; i < cand_count; i++)
-    {
-      if (check_version (cands[i]->version, req.constraint))
+        
+      SatConstraint req = queue[q_head++];
+      Package *existing = find_in_assignment (*assignment, *assign_count, req.name);
+      
+      if (existing)
         {
-          if (*assign_count >= *assign_cap)
-            {
-              *assign_cap *= 2;
-              *assignment = xrealloc (*assignment, *assign_cap * sizeof (Package *));
-            }
-            
-          (*assignment)[*assign_count] = cands[i];
-          (*assign_count)++;
+          if (!check_version (existing->version, req.constraint))
+            goto backtrack;
+          continue; /* Constraint met */
+        }
 
-          size_t old_tail = q_tail;
-          size_t needed = cands[i]->dep_count + (!cands[i]->is_installed && strcmp (cands[i]->type, "source") == 0 ? cands[i]->makedep_count : 0);
-          
-          if (q_tail + needed >= *q_cap)
+      /* Create a new branch (Choice Point) */
+      if (stack_top >= stack_cap)
+        {
+          stack_cap *= 2;
+          stack = xrealloc (stack, stack_cap * sizeof (StackFrame));
+        }
+
+      StackFrame *frame = &stack[stack_top++];
+      frame->req = req;
+      frame->cands = db_fetch_all_versions (req.name, &frame->cand_count);
+      qsort (frame->cands, frame->cand_count, sizeof (Package *), compare_versions_desc);
+      frame->cand_idx = 0;
+      frame->old_assign_count = *assign_count;
+
+explore_candidates:
+      if (frame->cand_idx >= frame->cand_count)
+        {
+          free (frame->cands);
+          stack_top--;
+backtrack:
+          if (stack_top == 0)
             {
-              while (q_tail + needed >= *q_cap) *q_cap *= 2;
-              *queue = xrealloc (*queue, *q_cap * sizeof (SatConstraint));
+              free (stack);
+              free (queue);
+              return false; /* Unsatisfiable */
             }
+          frame = &stack[stack_top - 1];
+          *assign_count = frame->old_assign_count;
           
-          for (size_t d = 0; d < cands[i]->dep_count; d++)
+          /* Re-evaluate queue position */
+          q_tail = q_head; 
+          for (size_t i = 0; i < *assign_count; i++)
             {
-              (*queue)[q_tail].name = cands[i]->dep_names[d];
-              (*queue)[q_tail].constraint = cands[i]->dep_constraints[d];
-              q_tail++;
-            }
-            
-          if (!cands[i]->is_installed && strcmp (cands[i]->type, "source") == 0)
-            {
-              for (size_t d = 0; d < cands[i]->makedep_count; d++)
+              Package *p = (*assignment)[i];
+              for (size_t d = 0; d < p->dep_count; d++)
                 {
-                  (*queue)[q_tail].name = cands[i]->makedep_names[d];
-                  (*queue)[q_tail].constraint = cands[i]->makedep_constraints[d];
+                  queue[q_tail].name = p->dep_names[d];
+                  queue[q_tail].constraint = p->dep_constraints[d];
                   q_tail++;
                 }
+              if (!p->is_installed && strcmp (p->type, "source") == 0)
+                {
+                  for (size_t d = 0; d < p->makedep_count; d++)
+                    {
+                      queue[q_tail].name = p->makedep_names[d];
+                      queue[q_tail].constraint = p->makedep_constraints[d];
+                      q_tail++;
+                    }
+                }
             }
+          goto explore_candidates;
+        }
 
-          if (sat_solve (assignment, assign_count, assign_cap, queue, q_head + 1, q_tail, q_cap))
+      Package *cand = frame->cands[frame->cand_idx++];
+      if (!check_version (cand->version, frame->req.constraint))
+        goto explore_candidates;
+
+      if (*assign_count >= assign_cap)
+        {
+          assign_cap *= 2;
+          *assignment = xrealloc (*assignment, assign_cap * sizeof (Package *));
+        }
+      (*assignment)[(*assign_count)++] = cand;
+
+      size_t needed = cand->dep_count + (!cand->is_installed && strcmp (cand->type, "source") == 0 ? cand->makedep_count : 0);
+      if (q_tail + needed >= queue_cap)
+        {
+          queue_cap *= 2;
+          queue = xrealloc (queue, queue_cap * sizeof (SatConstraint));
+        }
+
+      for (size_t d = 0; d < cand->dep_count; d++)
+        {
+          queue[q_tail].name = cand->dep_names[d];
+          queue[q_tail].constraint = cand->dep_constraints[d];
+          q_tail++;
+        }
+        
+      if (!cand->is_installed && strcmp (cand->type, "source") == 0)
+        {
+          for (size_t d = 0; d < cand->makedep_count; d++)
             {
-              free (cands);
-              return true;
+              queue[q_tail].name = cand->makedep_names[d];
+              queue[q_tail].constraint = cand->makedep_constraints[d];
+              q_tail++;
             }
-
-          (*assign_count)--;
-          q_tail = old_tail;
         }
     }
-    
-  if (cands) free (cands);
-  cache_conflict (state_hash);
-  return false;
 }
 
 static void
-topo_visit (Package *p, Package **assignment, size_t assign_count, BuildList *order)
+kahn_topological_sort (Package **assignment, size_t count, BuildList *order)
 {
-  if (p->state == STATE_RESOLVED) return;
-  if (p->state == STATE_VISITING) return; 
+  int *in_degree = calloc (count, sizeof (int));
+  int **adj = malloc (count * sizeof (int *));
+  int *adj_count = calloc (count, sizeof (int));
+  int *adj_cap = calloc (count, sizeof (int));
   
-  p->state = STATE_VISITING;
-  
-  for (size_t i = 0; i < p->dep_count; i++)
+  for (size_t i = 0; i < count; i++)
     {
-      Package *dep = find_in_assignment (assignment, assign_count, p->dep_names[i]);
-      if (dep) topo_visit (dep, assignment, assign_count, order);
+      adj_cap[i] = 4;
+      adj[i] = malloc (adj_cap[i] * sizeof (int));
     }
-    
-  if (!p->is_installed && strcmp (p->type, "source") == 0)
+
+  for (size_t i = 0; i < count; i++)
     {
-      for (size_t i = 0; i < p->makedep_count; i++)
+      Package *p = assignment[i];
+      for (size_t j = 0; j < count; j++)
         {
-          Package *dep = find_in_assignment (assignment, assign_count, p->makedep_names[i]);
-          if (dep) topo_visit (dep, assignment, assign_count, order);
+          Package *dep = assignment[j];
+          if (i == j) continue;
+          
+          bool is_dep = false;
+          for (size_t d = 0; d < p->dep_count; d++)
+            if (strcmp (p->dep_names[d], dep->name) == 0) is_dep = true;
+            
+          if (!p->is_installed && strcmp (p->type, "source") == 0)
+            {
+              for (size_t d = 0; d < p->makedep_count; d++)
+                if (strcmp (p->makedep_names[d], dep->name) == 0) is_dep = true;
+            }
+            
+          if (is_dep)
+            {
+              if (adj_count[j] >= adj_cap[j])
+                {
+                  adj_cap[j] *= 2;
+                  adj[j] = realloc (adj[j], adj_cap[j] * sizeof (int));
+                }
+              adj[j][adj_count[j]++] = i;
+              in_degree[i]++;
+            }
         }
     }
-    
-  p->state = STATE_RESOLVED;
-  build_list_add (order, p);
+
+  int *queue = malloc (count * sizeof (int));
+  int head = 0, tail = 0;
+
+  for (size_t i = 0; i < count; i++)
+    {
+      if (in_degree[i] == 0)
+        queue[tail++] = i;
+    }
+
+  while (head < tail)
+    {
+      int u = queue[head++];
+      build_list_add (order, assignment[u]);
+      
+      for (int i = 0; i < adj_count[u]; i++)
+        {
+          int v = adj[u][i];
+          if (--in_degree[v] == 0)
+            queue[tail++] = v;
+        }
+    }
+
+  free (queue);
+  free (in_degree);
+  free (adj_count);
+  for (size_t i = 0; i < count; i++) free (adj[i]);
+  free (adj);
+  free (adj_cap);
 }
 
 int
 resolve_dependencies (Package *root, BuildList *build_order)
 {
-  size_t assign_cap = 1024;
-  Package **assignment = xmalloc (assign_cap * sizeof (Package *));
+  Package **assignment = NULL;
   size_t assign_count = 0;
+  SatConstraint req = { root->name, "" };
 
-  size_t q_cap = 4096;
-  SatConstraint *queue = xmalloc (q_cap * sizeof (SatConstraint));
-  
-  queue[0].name = root->name;
-  queue[0].constraint = "";
-  
-  if (!sat_solve (&assignment, &assign_count, &assign_cap, &queue, 0, 1, &q_cap))
+  if (!iterative_sat_solve (&assignment, &assign_count, &req))
     {
       print_err ("Dependency resolution failed for '%s'. Unmet constraints or conflicts.", root->name);
-      free (assignment);
-      free (queue);
+      if (assignment) free (assignment);
       exit (EXIT_FAILURE);
     }
 
-  for (size_t i = 0; i < assign_count; i++)
-    assignment[i]->state = STATE_UNVISITED;
-
-  Package *resolved_root = find_in_assignment (assignment, assign_count, root->name);
-  topo_visit (resolved_root, assignment, assign_count, build_order);
+  kahn_topological_sort (assignment, assign_count, build_order);
 
   free (assignment);
-  free (queue);
   return 0;
 }

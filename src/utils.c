@@ -10,9 +10,6 @@
 #include <errno.h>
 #include "bhpkg.h"
 
-int g_verbosity = 1;
-bool g_pacman_mode = false;
-
 void *
 xmalloc (size_t size)
 {
@@ -53,12 +50,39 @@ xstrdup (const char *s)
   return dup;
 }
 
+uint64_t
+fnv1a_hash (const char *str)
+{
+  uint64_t hash = 14695981039346656037ULL;
+  while (*str)
+    {
+      hash ^= (unsigned char)(*str++);
+      hash *= 1099511628211ULL;
+    }
+  return hash;
+}
+
+bool
+is_use_flag_enabled (const char *flag)
+{
+  bool default_state = true;
+  if (flag[0] == '-')
+    return false;
+
+  for (size_t i = 0; i < g_use_flag_count; i++)
+    {
+      if (strcmp (g_use_flags[i], flag) == 0)
+        return true;
+      if (g_use_flags[i][0] == '-' && strcmp (g_use_flags[i] + 1, flag) == 0)
+        return false;
+    }
+  return default_state;
+}
+
 void
 print_msg (const char *msg, ...)
 {
-  if (g_verbosity < 1)
-    return;
-    
+  if (g_verbosity < 1) return;
   va_list args;
   printf ("%s==>%s %s", C_CYN, C_RST, C_BLD);
   va_start (args, msg);
@@ -95,8 +119,7 @@ safe_exec (char *const argv[])
   pid_t pid = fork ();
   int status;
 
-  if (pid < 0)
-    return false;
+  if (pid < 0) return false;
   if (pid == 0)
     {
       execvp (argv[0], argv);
@@ -107,20 +130,14 @@ safe_exec (char *const argv[])
   return WIFEXITED (status) && WEXITSTATUS (status) == 0;
 }
 
+/* Zero-copy file copy utilizing copy_file_range syscall */
 bool
 zero_copy_file (const char *src, const char *dst, mode_t mode)
 {
-  int fd_in;
-  int fd_out;
-  struct stat sb;
-  size_t len;
-  ssize_t ret;
-
-  fd_in = open (src, O_RDONLY | O_CLOEXEC | O_NOATIME);
-  if (fd_in < 0 && errno == EPERM)
-    fd_in = open (src, O_RDONLY | O_CLOEXEC);
-
-  fd_out = open (dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+  int fd_in = open (src, O_RDONLY | O_CLOEXEC | O_NOATIME);
+  if (fd_in < 0 && errno == EPERM) fd_in = open (src, O_RDONLY | O_CLOEXEC);
+  
+  int fd_out = open (dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
   
   if (fd_in < 0 || fd_out < 0)
     {
@@ -130,7 +147,7 @@ zero_copy_file (const char *src, const char *dst, mode_t mode)
     }
 
   fchmod (fd_out, mode);
-
+  struct stat sb;
   if (fstat (fd_in, &sb) != 0)
     {
       close (fd_in);
@@ -138,7 +155,7 @@ zero_copy_file (const char *src, const char *dst, mode_t mode)
       return false;
     }
   
-  len = sb.st_size;
+  size_t len = sb.st_size;
 
 #if defined(POSIX_FADV_SEQUENTIAL)
   posix_fadvise (fd_in, 0, 0, POSIX_FADV_SEQUENTIAL);
@@ -146,29 +163,20 @@ zero_copy_file (const char *src, const char *dst, mode_t mode)
 
   while (len > 0)
     {
-      ret = copy_file_range (fd_in, NULL, fd_out, NULL, len, 0);
+      ssize_t ret = copy_file_range (fd_in, NULL, fd_out, NULL, len, 0);
       if (ret < 0)
         {
           char buf[32768];
           ssize_t bytes_read = read (fd_in, buf, sizeof (buf));
-          if (bytes_read <= 0)
-            break;
-          if (write (fd_out, buf, bytes_read) < 0)
-            break;
+          if (bytes_read <= 0) break;
+          if (write (fd_out, buf, bytes_read) < 0) break;
           len -= bytes_read;
         }
-      else if (ret == 0)
-        {
-          break;
-        }
-      else
-        {
-          len -= ret;
-        }
+      else if (ret == 0) break;
+      else len -= ret;
     }
     
   fsync (fd_out);
-  
   close (fd_in);
   close (fd_out);
   return true;
@@ -183,23 +191,23 @@ package_free (Package *p)
   if (p->version) free (p->version);
   if (p->type) free (p->type);
   if (p->license) free (p->license);
+  if (p->repo_origin) free (p->repo_origin);
   if (p->build_script) free (p->build_script);
   if (p->pre_install) free (p->pre_install);
   if (p->post_install) free (p->post_install);
   if (p->pre_remove) free (p->pre_remove);
   if (p->post_remove) free (p->post_remove);
+  if (p->base_package_name) free (p->base_package_name);
   
   if (p->sources)
     {
-      for (size_t j = 0; j < p->num_sources; j++)
-        if (p->sources[j]) free (p->sources[j]);
+      for (size_t j = 0; j < p->num_sources; j++) if (p->sources[j]) free (p->sources[j]);
       free (p->sources);
     }
     
   if (p->hashes)
     {
-      for (size_t j = 0; j < p->num_sources; j++)
-        if (p->hashes[j]) free (p->hashes[j]);
+      for (size_t j = 0; j < p->num_sources; j++) if (p->hashes[j]) free (p->hashes[j]);
       free (p->hashes);
     }
     
@@ -223,6 +231,18 @@ package_free (Package *p)
         }
       free (p->makedep_names);
       free (p->makedep_constraints);
+    }
+    
+  if (p->subpackages)
+    {
+      for (size_t i = 0; i < p->subpkg_count; i++)
+        {
+          if (p->subpackages[i].name) free (p->subpackages[i].name);
+          for (size_t j = 0; j < p->subpackages[i].pattern_count; j++)
+            if (p->subpackages[i].patterns[j]) free (p->subpackages[i].patterns[j]);
+          free (p->subpackages[i].patterns);
+        }
+      free (p->subpackages);
     }
     
   free (p);

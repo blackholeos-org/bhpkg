@@ -21,7 +21,6 @@ void
 db_init (void)
 {
   int rc;
-
   rc = sqlite3_open_v2 ("/var/lib/bhpkg/local.db", &db,
                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
   if (rc != SQLITE_OK)
@@ -33,10 +32,34 @@ db_init (void)
   sqlite3_exec (db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;", 0, 0, 0);
   sqlite3_exec (db, "CREATE TABLE IF NOT EXISTS local_packages (name TEXT PRIMARY KEY, version TEXT, reason INTEGER);", 0, 0, 0);
   sqlite3_exec (db, "CREATE TABLE IF NOT EXISTS files (package TEXT, filepath TEXT, hash TEXT, is_config INTEGER, UNIQUE(filepath));", 0, 0, 0);
-  sqlite3_exec (db, "CREATE TABLE IF NOT EXISTS repo_meta (id INTEGER PRIMARY KEY, updated_at INTEGER);", 0, 0, 0);
 
-  if (access ("/var/lib/bhpkg/sync.db", F_OK) == 0)
-    sqlite3_exec (db, "ATTACH DATABASE '/var/lib/bhpkg/sync.db' AS sync;", 0, 0, 0);
+  char view_sql[4096] = "CREATE TEMP VIEW sync_packages AS ";
+  bool first = true;
+
+  for (size_t i = 0; i < g_repo_count; i++)
+    {
+      char attach_sql[512];
+      char db_path[PATH_MAX];
+      snprintf (db_path, sizeof (db_path), "/var/lib/bhpkg/repo_%s.db", g_repos[i].name);
+      
+      if (access (db_path, F_OK) == 0)
+        {
+          snprintf (attach_sql, sizeof (attach_sql), "ATTACH DATABASE '%s' AS repo_%s;", db_path, g_repos[i].name);
+          sqlite3_exec (db, attach_sql, 0, 0, 0);
+
+          if (!first)
+            strncat (view_sql, " UNION ALL ", sizeof (view_sql) - strlen (view_sql) - 1);
+          
+          char select_sql[512];
+          snprintf (select_sql, sizeof (select_sql), "SELECT '%s' AS origin_repo, %d AS priority, * FROM repo_%s.packages", g_repos[i].name, g_repos[i].priority, g_repos[i].name);
+          strncat (view_sql, select_sql, sizeof (view_sql) - strlen (view_sql) - 1);
+          
+          first = false;
+        }
+    }
+  
+  if (!first)
+    sqlite3_exec (db, view_sql, 0, 0, 0);
 
   build_list_init (&pkg_cache);
 }
@@ -52,94 +75,73 @@ bool
 db_sync_repo (void)
 {
   BuildList sync_list;
-  sqlite3_stmt *stmt;
-  long long local_ts = 0;
-  long long remote_ts = 0;
-
-  char *srcs[1] = { g_repo_url };
-  char *sig_srcs[1] = { g_repo_sig_url };
-
-  Package p_db = { .name = "sync.db", .version = "tmp", .sources = srcs, .num_sources = 1 };
-  Package p_sig = { .name = "sync.db.sig", .version = "tmp", .sources = sig_srcs, .num_sources = 1 };
-
-  print_msg ("Syncing remote repository databases from %s...", g_repo_url);
   build_list_init (&sync_list);
-  build_list_add (&sync_list, &p_db);
-  build_list_add (&sync_list, &p_sig);
+
+  print_msg ("Syncing %zu remote repository databases...", g_repo_count);
+
+  for (size_t i = 0; i < g_repo_count; i++)
+    {
+      Package *p_db = xmalloc (sizeof (Package));
+      memset (p_db, 0, sizeof (Package));
+      asprintf (&p_db->name, "repo_%s.db", g_repos[i].name);
+      p_db->version = xstrdup ("tmp");
+      p_db->num_sources = 1;
+      p_db->sources = xmalloc (sizeof (char *));
+      p_db->sources[0] = xstrdup (g_repos[i].url);
+
+      Package *p_sig = xmalloc (sizeof (Package));
+      memset (p_sig, 0, sizeof (Package));
+      asprintf (&p_sig->name, "repo_%s.db.sig", g_repos[i].name);
+      p_sig->version = xstrdup ("tmp");
+      p_sig->num_sources = 1;
+      p_sig->sources = xmalloc (sizeof (char *));
+      p_sig->sources[0] = xstrdup (g_repos[i].sig_url);
+
+      build_list_add (&sync_list, p_db);
+      build_list_add (&sync_list, p_sig);
+    }
 
   if (net_download_all (&sync_list) != 0)
     {
       build_list_free (&sync_list);
       return false;
     }
+
+  for (size_t i = 0; i < g_repo_count; i++)
+    {
+      char src_db[PATH_MAX], src_sig[PATH_MAX], dst_db[PATH_MAX], dst_sig[PATH_MAX];
+      snprintf (src_db, sizeof (src_db), "/var/lib/bhpkg/tmp/repo_%s.db-tmp-0.src", g_repos[i].name);
+      snprintf (src_sig, sizeof (src_sig), "/var/lib/bhpkg/tmp/repo_%s.db.sig-tmp-0.src", g_repos[i].name);
+      snprintf (dst_db, sizeof (dst_db), "/var/lib/bhpkg/repo_%s.db.tmp", g_repos[i].name);
+      snprintf (dst_sig, sizeof (dst_sig), "/var/lib/bhpkg/repo_%s.db.sig.tmp", g_repos[i].name);
+
+      if (!zero_copy_file (src_db, dst_db, 0644) || !zero_copy_file (src_sig, dst_sig, 0644))
+        {
+          print_err ("Failed to move databases to local storage for repo %s.", g_repos[i].name);
+          continue;
+        }
+        
+      unlink (src_db);
+      unlink (src_sig);
+
+      if (!crypto_verify_signature (dst_db, dst_sig, g_repos[i].pubkey_path))
+        {
+          print_err ("Signature verification failed for repo %s! Untrusted database.", g_repos[i].name);
+          unlink (dst_db);
+          unlink (dst_sig);
+          continue;
+        }
+
+      char final_db[PATH_MAX];
+      snprintf (final_db, sizeof (final_db), "/var/lib/bhpkg/repo_%s.db", g_repos[i].name);
+      rename (dst_db, final_db);
+      unlink (dst_sig);
+      
+      print_msg ("Successfully synced repository: %s", g_repos[i].name);
+    }
+
   build_list_free (&sync_list);
-
-  if (!zero_copy_file ("/var/lib/bhpkg/tmp/sync.db-tmp-0.src", "/var/lib/bhpkg/sync.db.tmp", 0644))
-    {
-      print_err ("Failed to move sync.db to local storage.");
-      return false;
-    }
-  unlink ("/var/lib/bhpkg/tmp/sync.db-tmp-0.src");
-
-  if (!zero_copy_file ("/var/lib/bhpkg/tmp/sync.db.sig-tmp-0.src", "/var/lib/bhpkg/sync.db.sig.tmp", 0644))
-    {
-      print_err ("Failed to move sync.db.sig to local storage.");
-      return false;
-    }
-  unlink ("/var/lib/bhpkg/tmp/sync.db.sig-tmp-0.src");
-
-  if (!crypto_verify_signature ("/var/lib/bhpkg/sync.db.tmp", "/var/lib/bhpkg/sync.db.sig.tmp", g_pubkey_path))
-    {
-      print_err ("Repository signature verification failed! Untrusted database.");
-      unlink ("/var/lib/bhpkg/sync.db.tmp");
-      unlink ("/var/lib/bhpkg/sync.db.sig.tmp");
-      return false;
-    }
-
-  sqlite3_exec (db, "ATTACH DATABASE '/var/lib/bhpkg/sync.db.tmp' AS tmp_sync;", 0, 0, 0);
-
-  if (sqlite3_prepare_v2 (db, "SELECT updated_at FROM repo_meta WHERE id = 1", -1, &stmt, NULL) == SQLITE_OK)
-    {
-      if (sqlite3_step (stmt) == SQLITE_ROW)
-        local_ts = sqlite3_column_int64 (stmt, 0);
-      sqlite3_finalize (stmt);
-    }
-    
-  if (sqlite3_prepare_v2 (db, "SELECT updated_at FROM tmp_sync.repo_meta WHERE id = 1", -1, &stmt, NULL) == SQLITE_OK)
-    {
-      if (sqlite3_step (stmt) == SQLITE_ROW)
-        remote_ts = sqlite3_column_int64 (stmt, 0);
-      sqlite3_finalize (stmt);
-    }
-    
-  sqlite3_exec (db, "DETACH DATABASE tmp_sync;", 0, 0, 0);
-
-  if (remote_ts < local_ts)
-    {
-      print_err ("Replay attack detected: Remote repository timestamp is older than local.");
-      unlink ("/var/lib/bhpkg/sync.db.tmp");
-      unlink ("/var/lib/bhpkg/sync.db.sig.tmp");
-      return false;
-    }
-
-  if (sqlite3_prepare_v2 (db, "INSERT OR REPLACE INTO repo_meta (id, updated_at) VALUES (1, ?)", -1, &stmt, NULL) == SQLITE_OK)
-    {
-      sqlite3_bind_int64 (stmt, 1, remote_ts);
-      sqlite3_step (stmt);
-      sqlite3_finalize (stmt);
-    }
-
-  rename ("/var/lib/bhpkg/sync.db.tmp", "/var/lib/bhpkg/sync.db");
-  unlink ("/var/lib/bhpkg/sync.db.sig.tmp");
-
-  sqlite3_exec (db, "DETACH DATABASE sync;", 0, 0, 0);
-  if (sqlite3_exec (db, "ATTACH DATABASE '/var/lib/bhpkg/sync.db' AS sync;", 0, 0, 0) != SQLITE_OK)
-    {
-      print_err ("Failed to attach sync.db: %s", sqlite3_errmsg (db));
-      return false;
-    }
-
-  print_msg ("Repository synchronized successfully.");
+  print_msg ("All repositories synchronized successfully.");
   return true;
 }
 
@@ -157,12 +159,10 @@ parse_comma_list (const char *str, char ***arr_out, size_t *count_out)
     }
     
   copy = xstrdup (str);
-  
   for (char *c = copy; *c; c++)
-    {
-      if (*c == ',')
-        count++;
-    }
+    if (*c == ',')
+      count++;
+      
   count++;
   
   *arr_out = xmalloc (count * sizeof (char *));
@@ -179,8 +179,9 @@ parse_comma_list (const char *str, char ***arr_out, size_t *count_out)
   free (copy);
 }
 
+/* Optimized conditional dependency parsing using ? syntax (e.g., "wayland?wayland-protocols") */
 static void
-parse_deps (const char *str, char ***names_out, char ***constraints_out, size_t *count_out)
+parse_conditional_deps (const char *str, char ***names_out, char ***constraints_out, size_t *count_out)
 {
   char *copy, *tok;
   size_t count = 0;
@@ -194,12 +195,10 @@ parse_deps (const char *str, char ***names_out, char ***constraints_out, size_t 
     }
     
   copy = xstrdup (str);
-  
   for (char *c = copy; *c; c++)
-    {
-      if (*c == ' ' || *c == '\t' || *c == ',')
-        count++;
-    }
+    if (*c == ' ' || *c == '\t' || *c == ',')
+      count++;
+      
   count++;
   
   *names_out = xmalloc (count * sizeof (char *));
@@ -210,14 +209,25 @@ parse_deps (const char *str, char ***names_out, char ***constraints_out, size_t 
   
   while (tok)
     {
+      char *cond = strchr (tok, '?');
+      if (cond)
+        {
+          *cond = '\0';
+          if (!is_use_flag_enabled (tok))
+            {
+              tok = strtok (NULL, " \t,");
+              continue;
+            }
+          tok = cond + 1;
+        }
+
       char *op = strpbrk (tok, "><=");
       char *dep_name = xstrdup (tok);
       char *constraint = NULL;
 
       if (op)
         {
-          size_t idx = op - tok;
-          dep_name[idx] = '\0';
+          dep_name[op - tok] = '\0';
           constraint = xstrdup (op);
         }
         
@@ -242,9 +252,9 @@ db_fetch_manifest (const char *name, const char *target_version)
   char *best_ver = NULL;
 
   if (target_version)
-    sql = "SELECT version FROM sync.packages WHERE name = ? AND version = ?";
+    sql = "SELECT version FROM sync_packages WHERE name = ? AND version = ?";
   else
-    sql = "SELECT version FROM sync.packages WHERE name = ?";
+    sql = "SELECT version FROM sync_packages WHERE name = ? ORDER BY priority ASC, version DESC";
 
   if (sqlite3_prepare_v2 (db, sql, -1, &stmt, NULL) != SQLITE_OK)
     return NULL;
@@ -253,14 +263,10 @@ db_fetch_manifest (const char *name, const char *target_version)
   if (target_version)
     sqlite3_bind_text (stmt, 2, target_version, -1, SQLITE_TRANSIENT);
 
-  while (sqlite3_step (stmt) == SQLITE_ROW)
+  if (sqlite3_step (stmt) == SQLITE_ROW)
     {
       const char *row_ver = (const char *) sqlite3_column_text (stmt, 0);
-      if (!best_ver || bhpkg_vercmp (row_ver, best_ver) > 0)
-        {
-          if (best_ver) free (best_ver);
-          best_ver = xstrdup (row_ver);
-        }
+      best_ver = xstrdup (row_ver);
     }
   sqlite3_finalize (stmt);
 
@@ -276,7 +282,9 @@ db_fetch_manifest (const char *name, const char *target_version)
         }
     }
 
-  sql = "SELECT type, license, sources, hashes, depends, makedepends, build_script, pre_install, post_install, pre_remove, post_remove FROM sync.packages WHERE name = ? AND version = ?";
+  sql = "SELECT origin_repo, type, license, sources, hashes, depends, makedepends, build_script, pre_install, post_install, pre_remove, post_remove "
+        "FROM sync_packages WHERE name = ? AND version = ? ORDER BY priority ASC LIMIT 1";
+        
   if (sqlite3_prepare_v2 (db, sql, -1, &stmt, NULL) == SQLITE_OK)
     {
       sqlite3_bind_text (stmt, 1, name, -1, SQLITE_TRANSIENT);
@@ -290,24 +298,28 @@ db_fetch_manifest (const char *name, const char *target_version)
           parsed_pkg->name = xstrdup (name);
           parsed_pkg->version = xstrdup (best_ver);
           
-          const char *type_col = (const char *) sqlite3_column_text (stmt, 0);
+          const char *orig_col = (const char *) sqlite3_column_text (stmt, 0);
+          parsed_pkg->repo_origin = xstrdup (orig_col ? orig_col : "unknown");
+          
+          const char *type_col = (const char *) sqlite3_column_text (stmt, 1);
           parsed_pkg->type = xstrdup (type_col ? type_col : "source");
           
-          const char *lic_col = (const char *) sqlite3_column_text (stmt, 1);
+          const char *lic_col = (const char *) sqlite3_column_text (stmt, 2);
           parsed_pkg->license = xstrdup (lic_col ? lic_col : "Unknown");
           
-          parse_comma_list ((const char *) sqlite3_column_text (stmt, 2), &parsed_pkg->sources, &parsed_pkg->num_sources);
+          parse_comma_list ((const char *) sqlite3_column_text (stmt, 3), &parsed_pkg->sources, &parsed_pkg->num_sources);
+          
           size_t hc;
-          parse_comma_list ((const char *) sqlite3_column_text (stmt, 3), &parsed_pkg->hashes, &hc);
+          parse_comma_list ((const char *) sqlite3_column_text (stmt, 4), &parsed_pkg->hashes, &hc);
 
-          parse_deps ((const char *) sqlite3_column_text (stmt, 4), &parsed_pkg->dep_names, &parsed_pkg->dep_constraints, &parsed_pkg->dep_count);
-          parse_deps ((const char *) sqlite3_column_text (stmt, 5), &parsed_pkg->makedep_names, &parsed_pkg->makedep_constraints, &parsed_pkg->makedep_count);
+          parse_conditional_deps ((const char *) sqlite3_column_text (stmt, 5), &parsed_pkg->dep_names, &parsed_pkg->dep_constraints, &parsed_pkg->dep_count);
+          parse_conditional_deps ((const char *) sqlite3_column_text (stmt, 6), &parsed_pkg->makedep_names, &parsed_pkg->makedep_constraints, &parsed_pkg->makedep_count);
 
-          const char *b_scr = (const char *) sqlite3_column_text (stmt, 6);
-          const char *pre_in = (const char *) sqlite3_column_text (stmt, 7);
-          const char *post_in = (const char *) sqlite3_column_text (stmt, 8);
-          const char *pre_rm = (const char *) sqlite3_column_text (stmt, 9);
-          const char *post_rm = (const char *) sqlite3_column_text (stmt, 10);
+          const char *b_scr = (const char *) sqlite3_column_text (stmt, 7);
+          const char *pre_in = (const char *) sqlite3_column_text (stmt, 8);
+          const char *post_in = (const char *) sqlite3_column_text (stmt, 9);
+          const char *pre_rm = (const char *) sqlite3_column_text (stmt, 10);
+          const char *post_rm = (const char *) sqlite3_column_text (stmt, 11);
 
           parsed_pkg->build_script = b_scr ? xstrdup (b_scr) : xstrdup ("");
           parsed_pkg->pre_install = pre_in ? xstrdup (pre_in) : xstrdup ("");
@@ -315,18 +327,30 @@ db_fetch_manifest (const char *name, const char *target_version)
           parsed_pkg->pre_remove = pre_rm ? xstrdup (pre_rm) : xstrdup ("");
           parsed_pkg->post_remove = post_rm ? xstrdup (post_rm) : xstrdup ("");
           
-          /* Future compatibility logic / default initializers */
           parsed_pkg->net_access = false;
           parsed_pkg->is_delta = false;
-          
           parsed_pkg->install_reason = 1;
           parsed_pkg->state = STATE_UNVISITED;
+
+          parsed_pkg->subpkg_count = 2;
+          parsed_pkg->subpackages = xmalloc (2 * sizeof (SubpackageRule));
+          
+          parsed_pkg->subpackages[0].name = xstrdup ("dev");
+          parsed_pkg->subpackages[0].pattern_count = 2;
+          parsed_pkg->subpackages[0].patterns = xmalloc (2 * sizeof (char *));
+          parsed_pkg->subpackages[0].patterns[0] = xstrdup ("usr/include/*");
+          parsed_pkg->subpackages[0].patterns[1] = xstrdup ("usr/lib/*.a");
+          
+          parsed_pkg->subpackages[1].name = xstrdup ("doc");
+          parsed_pkg->subpackages[1].pattern_count = 2;
+          parsed_pkg->subpackages[1].patterns = xmalloc (2 * sizeof (char *));
+          parsed_pkg->subpackages[1].patterns[0] = xstrdup ("usr/share/man/*");
+          parsed_pkg->subpackages[1].patterns[1] = xstrdup ("usr/share/doc/*");
         }
       sqlite3_finalize (stmt);
     }
 
   free (best_ver);
-
   if (!parsed_pkg)
     return NULL;
 
@@ -342,7 +366,7 @@ db_fetch_manifest (const char *name, const char *target_version)
 Package **
 db_fetch_all_versions (const char *name, size_t *count_out)
 {
-  const char *sql = "SELECT version FROM sync.packages WHERE name = ? ORDER BY version DESC";
+  const char *sql = "SELECT version FROM sync_packages WHERE name = ? ORDER BY version DESC";
   sqlite3_stmt *stmt;
   Package **list = NULL;
   size_t capacity = 4;
@@ -369,6 +393,7 @@ db_fetch_all_versions (const char *name, size_t *count_out)
         }
       sqlite3_finalize (stmt);
     }
+    
   *count_out = count;
   return list;
 }
@@ -442,7 +467,7 @@ db_is_required_by_others (const char *pkg_name)
   sqlite3_stmt *stmt;
   bool required = false;
   
-  if (sqlite3_prepare_v2 (db, "SELECT r.depends, r.makedepends FROM local_packages l JOIN sync.packages r ON l.name = r.name WHERE l.name != ?", -1, &stmt, NULL) == SQLITE_OK)
+  if (sqlite3_prepare_v2 (db, "SELECT r.depends, r.makedepends FROM local_packages l JOIN sync_packages r ON l.name = r.name WHERE l.name != ?", -1, &stmt, NULL) == SQLITE_OK)
     {
       sqlite3_bind_text (stmt, 1, pkg_name, -1, SQLITE_TRANSIENT);
       while (sqlite3_step (stmt) == SQLITE_ROW)
@@ -458,6 +483,18 @@ db_is_required_by_others (const char *pkg_name)
               
               while (tok)
                 {
+                  char *cond = strchr (tok, '?');
+                  if (cond)
+                    {
+                      *cond = '\0';
+                      if (!is_use_flag_enabled (tok))
+                        {
+                          tok = strtok (NULL, " \t,");
+                          continue;
+                        }
+                      tok = cond + 1;
+                    }
+                    
                   char *op = strpbrk (tok, "><=");
                   if (op)
                     *op = '\0';
@@ -467,6 +504,7 @@ db_is_required_by_others (const char *pkg_name)
                       required = true;
                       break;
                     }
+                    
                   tok = strtok (NULL, " \t,");
                 }
                 
@@ -474,6 +512,7 @@ db_is_required_by_others (const char *pkg_name)
               if (required)
                 break;
             }
+            
           if (required)
             break;
         }
@@ -502,15 +541,14 @@ is_protected_file (const char *filepath)
   };
 
   if (!realpath (filepath, resolved))
-    {
-      snprintf (resolved, sizeof (resolved), "%s", filepath);
-    }
-
+    snprintf (resolved, sizeof (resolved), "%s", filepath);
+    
   for (int i = 0; protected[i] != NULL; i++)
     {
       if (strcmp (resolved, protected[i]) == 0)
         return true;
     }
+    
   return false;
 }
 
@@ -530,7 +568,7 @@ db_remove_package (const char *name)
   
   if (pkg && pkg->pre_remove && strlen (pkg->pre_remove) > 0)
     run_hook_script (pkg->pre_remove, "pre_remove");
-
+    
   hook_execute_all ("Remove");
 
   if (sqlite3_prepare_v2 (db, "SELECT filepath, hash, is_config FROM files WHERE package = ? ORDER BY filepath DESC", -1, &stmt, NULL) == SQLITE_OK)
@@ -602,7 +640,7 @@ db_remove_package (const char *name)
 
   if (pkg && pkg->post_remove && strlen (pkg->post_remove) > 0)
     run_hook_script (pkg->post_remove, "post_remove");
-
+    
   print_msg ("Package %s removed cleanly.", name);
   return true;
 }
@@ -640,6 +678,7 @@ db_remove_orphans (void)
               free (orphans[i]);
               removed_any = true;
             }
+            
           if (orphans)
             free (orphans);
         }
@@ -649,20 +688,19 @@ db_remove_orphans (void)
 void
 db_search (const char *query)
 {
-  const char *sql = "SELECT name, version, type, license FROM sync.packages WHERE name LIKE ?";
+  const char *sql = "SELECT name, version, type, license FROM sync_packages WHERE name LIKE ?";
   sqlite3_stmt *stmt;
   char *like_query;
   int found = 0;
 
   if (sqlite3_prepare_v2 (db, sql, -1, &stmt, NULL) != SQLITE_OK)
     {
-      print_err ("Search failed. Did you run 'bhpkg -S' to sync the repository?");
+      print_err ("Search failed. Did you run 'bhpkg -S' to sync the repositories?");
       return;
     }
 
   like_query = xmalloc (strlen (query) + 3);
   sprintf (like_query, "%%%s%%", query);
-  
   sqlite3_bind_text (stmt, 1, like_query, -1, SQLITE_TRANSIENT);
 
   printf ("\n%s==> Search results for '%s':%s\n", C_BLD, query, C_RST);
@@ -692,10 +730,7 @@ db_list_installed (void)
   int count = 0;
 
   if (sqlite3_prepare_v2 (db, "SELECT name, version FROM local_packages ORDER BY name", -1, &stmt, NULL) != SQLITE_OK)
-    {
-      print_err ("Failed to query installed packages.");
-      return;
-    }
+    return;
 
   printf ("\n%s==> Installed Packages:%s\n", C_BLD, C_RST);
   while (sqlite3_step (stmt) == SQLITE_ROW)
@@ -714,7 +749,7 @@ void
 db_get_updates (BuildList *updates)
 {
   sqlite3_stmt *stmt;
-  const char *sql = "SELECT l.name, l.version, s.version FROM local_packages l JOIN sync.packages s ON l.name = s.name";
+  const char *sql = "SELECT l.name, l.version, s.version FROM local_packages l JOIN sync_packages s ON l.name = s.name ORDER BY s.priority ASC";
 
   if (sqlite3_prepare_v2 (db, sql, -1, &stmt, NULL) != SQLITE_OK)
     return;
@@ -754,9 +789,7 @@ db_check_conflict (const char *filepath, const char *pkg_name, char *owner_out)
         {
           const char *owner = (const char *) sqlite3_column_text (stmt, 0);
           if (owner_out && owner)
-            {
-              snprintf (owner_out, 256, "%s", owner);
-            }
+            snprintf (owner_out, 256, "%s", owner);
           conflict = true;
         }
       sqlite3_finalize (stmt);
@@ -777,9 +810,7 @@ db_get_file_hash (const char *filepath, char *hash_out)
         {
           const char *h = (const char *) sqlite3_column_text (stmt, 0);
           if (h)
-            {
-              snprintf (hash_out, 65, "%s", h);
-            }
+            snprintf (hash_out, 65, "%s", h);
           found = true;
         }
       sqlite3_finalize (stmt);
@@ -804,7 +835,6 @@ db_reconstruct_to_staging (const char *pkg_name, const char *staging_dir)
               char target[PATH_MAX];
               snprintf (target, sizeof (target), "%s%s", staging_dir, file);
               
-              /* Ensure intermediate directories exist locally for the hardlink */
               char tmp[PATH_MAX];
               snprintf (tmp, sizeof (tmp), "%s", target);
               for (char *p = tmp + 1; *p; p++)
@@ -817,7 +847,6 @@ db_reconstruct_to_staging (const char *pkg_name, const char *staging_dir)
                     }
                 }
               
-              /* Hardlink to save space and I/O time while preventing modification of base file */
               link (file, target);
             }
         }

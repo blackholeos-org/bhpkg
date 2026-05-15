@@ -11,9 +11,24 @@
 
 volatile sig_atomic_t g_interrupted = 0;
 
-char g_repo_url[256] = "https://repo.blackhole-os.org/sync.db";
-char g_repo_sig_url[256] = "https://repo.blackhole-os.org/sync.db.sig";
-char g_pubkey_path[256] = "/etc/bhpkg/repo-pub.pem";
+int g_verbosity = 1;
+bool g_pacman_mode = false;
+
+RepoConfig *g_repos = NULL;
+size_t g_repo_count = 0;
+
+char **g_use_flags = NULL;
+size_t g_use_flag_count = 0;
+
+static void
+strip_whitespace (char *str)
+{
+  char *p = str;
+  int l = strlen (p);
+  while (l > 0 && isspace ((unsigned char)p[l - 1])) p[--l] = '\0';
+  while (isspace ((unsigned char)*p)) p++;
+  if (p != str) memmove (str, p, l + 1);
+}
 
 void
 config_load (void)
@@ -21,48 +36,70 @@ config_load (void)
   FILE *f = fopen ("/etc/bhpkg/bhpkg.conf", "re");
   char *line = NULL;
   size_t len = 0;
+  char current_section[64] = {0};
   
-  if (!f) return;
+  if (UNLIKELY (!f)) return;
 
   while (getline (&line, &len, f) != -1)
     {
-      char *eq;
-      char *p = line;
-      char *k_end;
+      strip_whitespace (line);
+      if (line[0] == '#' || line[0] == ';' || line[0] == '\0') continue;
       
-      while (isspace ((unsigned char)*p)) p++;
-      
-      if (*p == '#' || *p == ';' || *p == '\0' || *p == '\n') 
-        continue;
-      
-      eq = strchr (p, '=');
+      if (line[0] == '[' && line[strlen (line) - 1] == ']')
+        {
+          strncpy (current_section, line + 1, sizeof (current_section) - 1);
+          current_section[strlen (current_section) - 1] = '\0';
+          
+          if (strncmp (current_section, "repo:", 5) == 0)
+            {
+              g_repos = xrealloc (g_repos, (g_repo_count + 1) * sizeof (RepoConfig));
+              memset (&g_repos[g_repo_count], 0, sizeof (RepoConfig));
+              strncpy (g_repos[g_repo_count].name, current_section + 5, sizeof (g_repos[0].name) - 1);
+              g_repos[g_repo_count].priority = 99;
+              g_repo_count++;
+            }
+          continue;
+        }
+        
+      char *eq = strchr (line, '=');
       if (!eq) continue;
-      
       *eq = '\0';
       
-      k_end = eq - 1;
-      while (k_end > p && isspace ((unsigned char)*k_end))
+      char *key = line;
+      char *val = eq + 1;
+      strip_whitespace (key);
+      strip_whitespace (val);
+      
+      if (val[0] == '"' && val[strlen (val) - 1] == '"')
         {
-          *k_end = '\0';
-          k_end--;
+          val[strlen (val) - 1] = '\0';
+          val++;
         }
       
-      char *val = eq + 1;
-      while (isspace ((unsigned char)*val)) val++;
-      val[strcspn (val, "\r\n")] = '\0';
-      
-      if (strcmp (p, "REPO_URL") == 0)
-        snprintf (g_repo_url, sizeof (g_repo_url), "%s", val);
-      else if (strcmp (p, "REPO_SIG_URL") == 0)
-        snprintf (g_repo_sig_url, sizeof (g_repo_sig_url), "%s", val);
-      else if (strcmp (p, "PUBKEY_PATH") == 0)
-        snprintf (g_pubkey_path, sizeof (g_pubkey_path), "%s", val);
-      else if (strcmp (p, "PACMAN_MODE") == 0)
-        g_pacman_mode = (strcmp (val, "true") == 0 || strcmp (val, "1") == 0);
-      else if (strcmp (p, "VERBOSITY") == 0)
-        g_verbosity = atoi (val);
+      if (strcmp (current_section, "options") == 0)
+        {
+          if (strcmp (key, "VERBOSITY") == 0) g_verbosity = atoi (val);
+          else if (strcmp (key, "PACMAN_MODE") == 0) g_pacman_mode = (strcmp (val, "true") == 0);
+          else if (strcmp (key, "USE") == 0)
+            {
+              char *tok = strtok (val, " \t");
+              while (tok)
+                {
+                  g_use_flags = xrealloc (g_use_flags, (g_use_flag_count + 1) * sizeof (char *));
+                  g_use_flags[g_use_flag_count++] = xstrdup (tok);
+                  tok = strtok (NULL, " \t");
+                }
+            }
+        }
+      else if (strncmp (current_section, "repo:", 5) == 0)
+        {
+          RepoConfig *r = &g_repos[g_repo_count - 1];
+          if (strcmp (key, "URL") == 0) strncpy (r->url, val, sizeof (r->url) - 1);
+          else if (strcmp (key, "SIG") == 0) strncpy (r->sig_url, val, sizeof (r->sig_url) - 1);
+          else if (strcmp (key, "PUBKEY") == 0) strncpy (r->pubkey_path, val, sizeof (r->pubkey_path) - 1);
+          else if (strcmp (key, "PRIORITY") == 0) r->priority = atoi (val);
+        }
     }
-    
   free (line);
   fclose (f);
 }
@@ -79,18 +116,17 @@ void
 print_help (void)
 {
   printf ("\n%sBlackhole Package Manager (bhpkg)%s\n", C_BLD, C_RST);
-  printf ("  -S, --sync          Sync repository database\n");
+  printf ("  -S, --sync          Sync repository databases\n");
   printf ("  -i, --install <pkg> Install a package explicitly\n");
   printf ("  -u, --update        Update entire system (or specific package)\n");
   printf ("  -R, --remove  <pkg> Remove a package cleanly\n");
   printf ("  -Rs <pkg>           Remove package and orphaned dependencies\n");
   printf ("  -Yc                 Remove all unneeded orphan packages globally\n");
-  printf ("  -Ss <query>         Search online repository\n");
+  printf ("  -Ss <query>         Search online repositories\n");
   printf ("  -Q                  List installed packages\n");
   printf ("  -Sc                 Clean cache directory\n\n");
   printf ("  -v, -vv, -vvv       Increase verbosity up to Debug/Trace logs\n");
   printf ("  -q, --quiet         Silent mode (Verbosity Level 0)\n\n");
-  printf ("  Flags can be combined fluidly (e.g., bhpkg -Syu or bhpkg -Si <pkg>)\n\n");
 }
 
 void
@@ -350,7 +386,7 @@ main (int argc, char **argv)
       Package *pkg = db_fetch_manifest (pkg_target, NULL);
       if (!pkg)
         {
-          print_err ("Package '%s' not found in sync.db!", pkg_target);
+          print_err ("Package '%s' not found in sync database!", pkg_target);
           db_close ();
           return 1;
         }

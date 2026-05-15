@@ -23,9 +23,17 @@ typedef enum { STATE_UNVISITED, STATE_VISITING, STATE_RESOLVED } ResolveState;
 typedef struct
 {
   char *name;
+  char **patterns;
+  size_t pattern_count;
+} SubpackageRule;
+
+typedef struct
+{
+  char *name;
   char *version;
   char *type;
   char *license;
+  char *repo_origin;
   
   char **sources;
   char **hashes;
@@ -38,6 +46,9 @@ typedef struct
   char **makedep_names;
   char **makedep_constraints;
   size_t makedep_count;
+  
+  SubpackageRule *subpackages;
+  size_t subpkg_count;
   
   char *build_script;
   char *pre_install;
@@ -52,8 +63,8 @@ typedef struct
   
   /* Feature Upgrades */
   bool is_subpackage;
-  bool net_access; /* Allows network escape during sandbox build */
-  bool is_delta;   /* Determines if we should apply file-level patching */
+  bool net_access;
+  bool is_delta;
   char *base_package_name;
   
 } Package;
@@ -71,12 +82,24 @@ typedef struct ConflictNode
   struct ConflictNode *next;
 } ConflictNode;
 
+typedef struct
+{
+  char name[64];
+  char url[256];
+  char sig_url[256];
+  char pubkey_path[256];
+  int priority;
+} RepoConfig;
+
 extern int g_verbosity;
 extern bool g_pacman_mode;
 extern volatile sig_atomic_t g_interrupted;
-extern char g_repo_url[256];
-extern char g_repo_sig_url[256];
-extern char g_pubkey_path[256];
+
+extern RepoConfig *g_repos;
+extern size_t g_repo_count;
+
+extern char **g_use_flags;
+extern size_t g_use_flag_count;
 
 /* version.c */
 int bhpkg_vercmp (const char *val, const char *ref);
@@ -85,6 +108,8 @@ int bhpkg_vercmp (const char *val, const char *ref);
 void *xmalloc (size_t size);
 void *xrealloc (void *ptr, size_t size);
 char *xstrdup (const char *s);
+uint64_t fnv1a_hash (const char *str);
+bool is_use_flag_enabled (const char *flag);
 void print_msg (const char *msg, ...);
 void print_err (const char *msg, ...);
 void print_warn (const char *msg, ...);
@@ -132,7 +157,6 @@ void db_reconstruct_to_staging (const char *pkg_name, const char *staging_dir);
 bool build_package (Package *pkg);
 bool install_artifact (Package *pkg);
 void run_hook_script (const char *script_body, const char *hook_name);
-void split_subpackages (Package *pkg, const char *fakeroot);
 void apply_delta_rm_manifest (const char *staging_dir);
 
 /* hook.c */
