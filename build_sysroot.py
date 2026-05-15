@@ -3,11 +3,9 @@ import os
 import subprocess
 import tarfile
 import requests
-import re
 import shlex
 from pathlib import Path
 
-# config
 ROOT = Path.cwd()
 SYSROOT = ROOT / "sysroot"
 BUILD_DIR = ROOT / "build_deps"
@@ -23,9 +21,16 @@ SYSROOT_STR = str(SYSROOT.resolve())
 
 ENV = os.environ.copy()
 ENV["CC"] = "musl-gcc"
-
+ENV["CFLAGS"] = "-O3 -flto -march=native -pipe -fPIE -fstack-protector-strong"
 ENV["PKG_CONFIG_LIBDIR"] = f"{SYSROOT_STR}/lib/pkgconfig:{SYSROOT_STR}/share/pkgconfig"
 ENV["PKG_CONFIG_PATH"] = ""
+
+ZLIB_URL = "https://zlib.net/fossils/zlib-1.3.2.tar.gz"
+OPENSSL_URL = "https://github.com/openssl/openssl/releases/download/openssl-4.0.0/openssl-4.0.0.tar.gz"
+ZSTD_URL = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz"
+SQLITE_URL = "https://www.sqlite.org/2026/sqlite-src-3530100.zip"
+CURL_URL = "https://curl.se/download/curl-8.20.0.tar.gz"
+LIBARCHIVE_URL = "https://github.com/libarchive/libarchive/releases/download/v3.8.7/libarchive-3.8.7.tar.gz"
 
 def log(msg):
     print(f"[*] {msg}")
@@ -91,44 +96,11 @@ def is_done(name):
 def mark_done(name):
     (STAMP_DIR / name).touch()
 
-def github_release_asset(repo, keyword):
-    api = f"https://api.github.com/repos/{repo}/releases/latest"
-    r = requests.get(api, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    
-    for asset in data.get("assets",[]):
-        if keyword in asset["name"] and asset["name"].endswith(".tar.gz"):
-            return asset["browser_download_url"]
-            
-    return data["tarball_url"]
-
-def scrape_sqlite():
-    try:
-        html = requests.get("https://www.sqlite.org/download.html", timeout=15).text
-        match = re.search(r"(\d{4}/sqlite-autoconf-\d+\.tar\.gz)", html)
-        if match:
-            return f"https://www.sqlite.org/{match.group(1)}"
-    except Exception as e:
-        log(f"Warning: SQLite scrape failed ({e})")
-    return "https://www.sqlite.org/2026/sqlite-autoconf-3530100.tar.gz"
-
-def scrape_curl():
-    try:
-        html = requests.get("https://curl.se/download.html", timeout=15).text
-        match = re.search(r"curl-([\d.]+)\.tar\.gz", html)
-        if match:
-            return f"https://curl.se/download/curl-{match.group(1)}.tar.gz"
-    except Exception as e:
-        log(f"Warning: cURL scrape failed ({e})")
-    return "https://curl.se/download/curl-8.20.0.tar.gz"
-
 def build_zlib():
     if is_done("zlib"): return
     log("Building zlib")
-    tar = fetch("https://zlib.net/current/zlib.tar.gz", "zlib.tar.gz")
+    tar = fetch(ZLIB_URL, "zlib.tar.gz")
     src = extract(tar)
-
     run(f"./configure --static --prefix={SYSROOT_STR}", cwd=src)
     run(f"make -j{JOBS}", cwd=src)
     run("make install", cwd=src)
@@ -137,10 +109,8 @@ def build_zlib():
 def build_openssl():
     if is_done("openssl"): return
     log("Building OpenSSL")
-    url = github_release_asset("openssl/openssl", "openssl")
-    tar = fetch(url, "openssl.tar.gz")
+    tar = fetch(OPENSSL_URL, "openssl.tar.gz")
     src = extract(tar)
-
     run(f"./Configure no-shared no-async no-secure-memory linux-x86_64 --prefix={SYSROOT_STR}", cwd=src)
     run(f"make -j{JOBS}", cwd=src)
     run("make install_sw", cwd=src)
@@ -149,13 +119,10 @@ def build_openssl():
 def build_zstd():
     if is_done("zstd"): return
     log("Building zstd")
-    url = github_release_asset("facebook/zstd", "zstd")
-    tar = fetch(url, "zstd.tar.gz")
+    tar = fetch(ZSTD_URL, "zstd.tar.gz")
     src = extract(tar)
-
     run(f"make lib-mt -j{JOBS}", cwd=src)
     run(f"make -C lib PREFIX={SYSROOT_STR} install", cwd=src)
-    
     for so_file in (SYSROOT / "lib").glob("*.so*"):
         so_file.unlink(missing_ok=True)
     mark_done("zstd")
@@ -163,14 +130,11 @@ def build_zstd():
 def build_sqlite():
     if is_done("sqlite"): return
     log("Building SQLite")
-    url = scrape_sqlite()
-    tar = fetch(url, "sqlite.tar.gz")
+    tar = fetch(SQLITE_URL, "sqlite.tar.gz")
     src = extract(tar)
-
     env = ENV.copy()
     env["LDFLAGS"] = f"-L{SYSROOT_STR}/lib -static"
     env["LIBS"] = "-pthread"
-
     run(f"./configure --enable-static --disable-shared --prefix={SYSROOT_STR}", cwd=src, env=env)
     run(f"make -j{JOBS}", cwd=src)
     run("make install", cwd=src)
@@ -179,16 +143,13 @@ def build_sqlite():
 def build_curl():
     if is_done("curl"): return
     log("Building curl")
-    url = scrape_curl()
-    tar = fetch(url, "curl.tar.gz")
+    tar = fetch(CURL_URL, "curl.tar.gz")
     src = extract(tar)
-
     env = ENV.copy()
     env["CPPFLAGS"] = f"-I{SYSROOT_STR}/include"
     env["LDFLAGS"] = f"-L{SYSROOT_STR}/lib -static"
     env["LIBS"] = "-pthread"
     env["PKG_CONFIG"] = "pkg-config --static"
-
     run(
         f"./configure --enable-static --disable-shared --with-openssl={SYSROOT_STR} "
         f"--prefix={SYSROOT_STR} --without-libidn2 --without-brotli "
@@ -202,22 +163,18 @@ def build_curl():
 def build_libarchive():
     if is_done("libarchive"): return
     log("Building libarchive")
-    url = github_release_asset("libarchive/libarchive", "libarchive")
-    tar = fetch(url, "libarchive.tar.gz")
+    tar = fetch(LIBARCHIVE_URL, "libarchive.tar.gz")
     src = extract(tar)
-
     env = ENV.copy()
     env["CPPFLAGS"] = f"-I{SYSROOT_STR}/include"
     env["LDFLAGS"] = f"-L{SYSROOT_STR}/lib -static"
     env["LIBS"] = "-pthread"
     env["PKG_CONFIG"] = "pkg-config --static"
-
     run(
         f"./configure --enable-static --disable-shared "
         f"--without-xml2 --without-expat --without-nettle --without-iconv "
         f"--without-openssl --without-cng --without-lzma --without-bzip2 "
-        f"--with-zstd --with-zlib "
-        f"--prefix={SYSROOT_STR}",
+        f"--with-zstd --with-zlib --prefix={SYSROOT_STR}",
         cwd=src, env=env
     )
     run(f"make -j{JOBS}", cwd=src)
@@ -231,9 +188,8 @@ def main():
     build_sqlite()
     build_curl()
     build_libarchive()
-
     print("\n====================================")
-    print(" [+] Sysroot build complete (Python)")
+    print(" Sysroot build complete")
     print("====================================")
 
 if __name__ == "__main__":
