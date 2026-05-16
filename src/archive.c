@@ -53,9 +53,18 @@ archive_extract (const char *filename, const char *dest_dir, int strip_component
       return false;
     }
 
-  getcwd (cwd, sizeof (cwd));
+  if (getcwd (cwd, sizeof (cwd)) == NULL)
+    {
+      print_err ("archive_extract: getcwd failed (errno: %d)", errno);
+      close (fd);
+      archive_read_free (a);
+      archive_write_free (ext);
+      return false;
+    }
+
   if (chdir (dest_dir) != 0)
     {
+      print_err ("archive_extract: chdir to %s failed (errno: %d)", dest_dir, errno);
       close (fd);
       archive_read_free (a);
       archive_write_free (ext);
@@ -121,7 +130,10 @@ archive_extract (const char *filename, const char *dest_dir, int strip_component
     }
 
   if (chdir (cwd) != 0)
-    success = false;
+    {
+      print_err ("archive_extract: chdir back to %s failed (errno: %d)", cwd, errno);
+      success = false;
+    }
 
   archive_read_close (a);
   archive_read_free (a);

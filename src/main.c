@@ -155,68 +155,6 @@ cache_prune (void)
   print_msg ("Removed %d cached artifacts.", count);
 }
 
-void
-process_build_queue (BuildList *order)
-{
-  BuildList to_download;
-  build_list_init (&to_download);
-
-  for (size_t i = 0; i < order->count; i++)
-    {
-      Package *p = order->pkgs[i];
-      char cache_path[PATH_MAX];
-      snprintf (cache_path, sizeof (cache_path), "/var/cache/bhpkg/%s-%s.tar.zst", p->name, p->version);
-
-      if (access (cache_path, F_OK) == 0)
-        p->is_cached = true;
-      if (!p->is_installed && !p->is_cached)
-        build_list_add (&to_download, p);
-    }
-
-  if (to_download.count > 0)
-    {
-      if (net_download_all (&to_download) != 0 || g_interrupted)
-        goto build_cleanup;
-    }
-
-  for (size_t i = 0; i < order->count; i++)
-    {
-      Package *p;
-      Package *old_p;
-
-      if (g_interrupted) break;
-      p = order->pkgs[i];
-
-      if (p->is_installed)
-        {
-          if (g_verbosity >= 1)
-            printf ("  %s[SKIP]%s %s is already up to date.\n", C_GRN, C_RST, p->name);
-          continue;
-        }
-
-      print_msg ("Processing [%s%s%s]", C_YLW, p->name, C_RST);
-
-      if (!p->is_cached && !build_package (p))
-        {
-          print_err ("Build failed for %s.", p->name);
-          exit (EXIT_FAILURE);
-        }
-
-      old_p = db_fetch_manifest (p->name, NULL);
-      if (old_p && old_p->is_installed)
-        print_warn ("Upgrading existing package: %s", p->name);
-
-      if (!install_artifact (p))
-        {
-          print_err ("Install failed for %s.", p->name);
-          exit (EXIT_FAILURE);
-        }
-    }
-
-build_cleanup:
-  build_list_free (&to_download);
-}
-
 static void
 detect_architecture (void)
 {
@@ -231,6 +169,86 @@ detect_architecture (void)
       strncpy (g_host_arch, buffer.machine, 31);
     }
 }
+
+void
+process_build_queue (BuildList *order)
+{
+  BuildList to_download;
+  build_list_init (&to_download);
+
+  for (size_t i = 0; i < order->count; i++)
+    {
+      Package *p = order->pkgs[i];
+      char cache_path[PATH_MAX];
+      snprintf (cache_path, sizeof (cache_path), "/var/cache/bhpkg/%s-%s.tar.zst", p->name, p->version);
+
+      if (access (cache_path, F_OK) == 0) p->is_cached = true;
+      if (!p->is_installed && !p->is_cached) build_list_add (&to_download, p);
+    }
+
+  if (to_download.count > 0 && net_download_all (&to_download) != 0)
+    goto build_cleanup;
+
+  print_msg ("Preparing to commit %zu packages to live filesystem...", order->count);
+  
+  db_begin_transaction ();
+  
+  bool commit_success = true;
+
+  for (size_t i = 0; i < order->count; i++)
+    {
+      Package *p = order->pkgs[i];
+      if (p->is_installed || g_interrupted) continue;
+
+      if (!p->is_cached && !build_package (p))
+        {
+          print_err ("Build failed for %s.", p->name);
+          commit_success = false;
+          break;
+        }
+
+      if (!stage_artifact (p))
+        {
+          print_err ("Failed to stage artifact for %s.", p->name);
+          commit_success = false;
+          break;
+        }
+
+      if (!commit_artifact (p))
+        {
+          commit_success = false;
+          break;
+        }
+    }
+
+  if (!commit_success || g_interrupted)
+    {
+      rollback_filesystem ();
+      db_rollback_transaction ();
+      print_err ("Transaction failed. System state was completely rolled back.");
+    }
+  else
+    {
+      db_commit_transaction ();
+      sync ();
+      hook_execute_all ("Install");
+      print_msg ("Transaction completed successfully.");
+    }
+
+  for (size_t i = 0; i < order->count; i++)
+    {
+      if (order->pkgs[i]->staging_dir[0])
+        {
+          char rm_cmd[PATH_MAX + 16];
+          snprintf (rm_cmd, sizeof(rm_cmd), "rm -rf %s", order->pkgs[i]->staging_dir);
+          system (rm_cmd);
+        }
+    }
+
+build_cleanup:
+  build_list_free (&to_download);
+}
+
 
 int
 main (int argc, char **argv)
@@ -255,12 +273,11 @@ main (int argc, char **argv)
   detect_architecture ();
   init_oom_pool ();
 
-  /* Wrap the entire execution in an Emergency Block. 
-     in case memory fails inside the solver or DB, xmalloc() throws us back here cleanly. */
   if (sigsetjmp (g_oom_env, 1) != 0)
     {
       print_err ("Package transaction aborted safely due to Out-Of-Memory.");
-      db_rollback ();
+      rollback_filesystem ();
+      db_rollback_transaction ();
       return EXIT_FAILURE;
     }
 
@@ -380,8 +397,8 @@ main (int argc, char **argv)
               BuildList order;
               if (g_interrupted) break;
               build_list_init (&order);
-              resolve_dependencies (up.pkgs[i], &order);
-              process_build_queue (&order);
+              if (resolve_dependencies (up.pkgs[i], &order) == 0)
+                process_build_queue (&order);
               build_list_free (&order);
             }
         }
@@ -400,8 +417,8 @@ main (int argc, char **argv)
         }
       pkg->install_reason = 0;
       build_list_init (&order);
-      resolve_dependencies (pkg, &order);
-      process_build_queue (&order);
+      if (resolve_dependencies (pkg, &order) == 0)
+        process_build_queue (&order);
       build_list_free (&order);
     }
 

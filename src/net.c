@@ -142,6 +142,10 @@ net_download_all (BuildList *list)
           curl_easy_setopt (curls[idx], CURLOPT_TCP_KEEPALIVE, 1L);
           curl_easy_setopt (curls[idx], CURLOPT_BUFFERSIZE, 102400L);
 
+          curl_easy_setopt (curls[idx], CURLOPT_CONNECTTIMEOUT, 15L);
+          curl_easy_setopt (curls[idx], CURLOPT_LOW_SPEED_LIMIT, 100L); /* 100 bytes/sec */
+          curl_easy_setopt (curls[idx], CURLOPT_LOW_SPEED_TIME, 15L);
+
           curl_multi_add_handle (multi, curls[idx]);
           idx++;
         }

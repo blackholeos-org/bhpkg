@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/x509.h>
 #include <openssl/err.h>
 #include "bhpkg.h"
 
@@ -79,6 +80,44 @@ crypto_verify_sha256 (const char *filepath, const char *expected_hash)
 }
 
 bool
+crypto_is_key_revoked (EVP_PKEY *pubkey)
+{
+  FILE *crl_file = fopen ("/etc/bhpkg/keys/revoked.txt", "re");
+  if (!crl_file) return false;
+
+  unsigned char *der = NULL;
+  int der_len = i2d_PublicKey (pubkey, &der);
+
+  if (der_len > 0)
+    {
+      unsigned char hash[EVP_MAX_MD_SIZE];
+      char hex_hash[65];
+      unsigned int md_len;
+
+      EVP_Digest (der, der_len, hash, &md_len, EVP_sha256 (), NULL);
+      OPENSSL_free (der);
+
+      for (unsigned int i = 0; i < md_len; i++)
+        sprintf (hex_hash + (i * 2), "%02x", hash[i]);
+      hex_hash[64] = '\0';
+
+      char line[128];
+      while (fgets (line, sizeof (line), crl_file))
+        {
+          line[strcspn (line, "\r\n")] = '\0';
+          if (strcmp (line, hex_hash) == 0)
+            {
+              fclose (crl_file);
+              return true;
+            }
+        }
+    }
+
+  fclose (crl_file);
+  return false;
+}
+
+bool
 crypto_verify_signature (const char *filepath, const char *sigpath, const char *pubkey_path)
 {
   FILE *keyfile, *sigfile;
@@ -103,6 +142,13 @@ crypto_verify_signature (const char *filepath, const char *sigpath, const char *
   if (!pubkey)
     {
       print_err ("Crypto: Failed to parse RSA public key.");
+      return false;
+    }
+
+  if (crypto_is_key_revoked (pubkey))
+    {
+      print_err ("CRITICAL: The repository public key HAS BEEN REVOKED! Aborting.");
+      EVP_PKEY_free (pubkey);
       return false;
     }
 

@@ -3,22 +3,65 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "bhpkg.h"
 
-typedef struct
-{
-  const char *name;
-  const char *constraint;
-} SatConstraint;
+extern void *arena_alloc (size_t size);
+extern void arena_init (void);
+extern void arena_free_all (void);
+
+typedef int32_t Lit;
+#define LIT_VAR(l) (abs(l))
+#define LIT_SIGN(l) ((l) < 0)
+#define MAKE_LIT(v, sign) ((sign) ? -(v) : (v))
 
 typedef struct
 {
-  SatConstraint req;
-  Package **cands;
-  size_t cand_count;
-  size_t cand_idx;
-  size_t old_assign_count;
-} StackFrame;
+  int size;
+  Lit *lits;
+} Clause;
+
+typedef struct
+{
+  int *data;
+  int size;
+  int cap;
+} LitVec;
+
+typedef struct
+{
+  int assigns;    /* 0=unassigned, 1=true, -1=false */
+  int level;
+  Clause *reason;
+  double activity;
+} VarData;
+
+typedef struct
+{
+  Package **pkgs;
+  int count;
+  int cap;
+} PkgList;
+
+static int g_num_vars = 0;
+static VarData *g_vars = NULL;
+static LitVec *g_watches = NULL;
+
+static LitVec g_trail;
+static LitVec g_trail_lim;
+static int g_qhead = 0;
+
+static Clause **g_clauses = NULL;
+static int g_num_clauses = 0;
+static int g_cap_clauses = 0;
+
+static Package **g_pkg_map = NULL;
+
+static inline int
+lit_index (Lit l)
+{
+  return (LIT_VAR (l) << 1) | (LIT_SIGN (l) ? 1 : 0);
+}
 
 void
 build_list_init (BuildList *list)
@@ -44,236 +87,209 @@ build_list_free (BuildList *list)
 {
   if (list->pkgs)
     free (list->pkgs);
-  
   list->pkgs = NULL;
   list->count = 0;
   list->capacity = 0;
 }
 
-static bool
-check_single_constraint (const char *installed_ver, const char *constraint)
+static void
+vec_push (LitVec *v, int val)
 {
-  char op[3] = { 0 };
-  char target[64] = { 0 };
-  int cmp;
-
-  if (sscanf (constraint, "%2[=><]%63s", op, target) != 2)
-    return true;
-
-  cmp = bhpkg_vercmp (installed_ver, target);
-  
-  if (strcmp (op, ">=") == 0) return cmp >= 0;
-  if (strcmp (op, "<=") == 0) return cmp <= 0;
-  if (strcmp (op, "==") == 0 || strcmp (op, "=") == 0) return cmp == 0;
-  if (strcmp (op, ">") == 0)  return cmp > 0;
-  if (strcmp (op, "<") == 0)  return cmp < 0;
-
-  return true;
-}
-
-static bool
-check_version (const char *installed_ver, const char *constraints)
-{
-  char *copy, *tok;
-
-  if (!constraints || strlen (constraints) == 0)
-    return true;
-
-  copy = xstrdup (constraints);
-  tok = strtok (copy, ",|");
-
-  while (tok)
+  if (v->size == v->cap)
     {
-      if (!check_single_constraint (installed_ver, tok))
-        {
-          free (copy);
-          return false;
-        }
-      tok = strtok (NULL, ",|");
+      v->cap = v->cap == 0 ? 4 : v->cap * 2;
+      int *new_data = arena_alloc (v->cap * sizeof (int));
+      if (v->size > 0)
+        memcpy (new_data, v->data, v->size * sizeof (int));
+      v->data = new_data;
     }
-
-  free (copy);
-  return true;
+  v->data[v->size++] = val;
 }
 
-static Package *
-find_in_assignment (Package **assignment, size_t count, const char *name)
+static void
+add_clause (Lit *lits, int size)
 {
-  for (size_t i = 0; i < count; i++)
+  if (size == 0) return;
+
+  Clause *c = arena_alloc (sizeof (Clause));
+  c->size = size;
+  c->lits = arena_alloc (size * sizeof (Lit));
+  memcpy (c->lits, lits, size * sizeof (Lit));
+
+  if (g_num_clauses >= g_cap_clauses)
     {
-      if (strcmp (assignment[i]->name, name) == 0)
-        return assignment[i];
+      g_cap_clauses = g_cap_clauses == 0 ? 1024 : g_cap_clauses * 2;
+      Clause **new_clauses = arena_alloc (g_cap_clauses * sizeof (Clause *));
+      if (g_num_clauses > 0)
+        memcpy (new_clauses, g_clauses, g_num_clauses * sizeof (Clause *));
+      g_clauses = new_clauses;
+    }
+  g_clauses[g_num_clauses] = c;
+
+  if (size >= 2)
+    {
+      vec_push (&g_watches[lit_index (lits[0])], g_num_clauses);
+      vec_push (&g_watches[lit_index (lits[1])], g_num_clauses);
+    }
+  else if (size == 1)
+    {
+      vec_push (&g_watches[lit_index (lits[0])], g_num_clauses);
+    }
+  g_num_clauses++;
+}
+
+static int
+val (Lit l)
+{
+  int v = LIT_VAR (l);
+  int asgn = g_vars[v].assigns;
+  if (asgn == 0) return 0;
+  return (asgn == 1) ^ LIT_SIGN (l) ? 1 : -1;
+}
+
+static void
+unchecked_enqueue (Lit p, Clause *from)
+{
+  int v = LIT_VAR (p);
+  g_vars[v].assigns = LIT_SIGN (p) ? -1 : 1;
+  g_vars[v].level = g_trail_lim.size;
+  g_vars[v].reason = from;
+  vec_push (&g_trail, p);
+}
+
+static Clause *
+bcp (void)
+{
+  while (g_qhead < g_trail.size)
+    {
+      Lit p = g_trail.data[g_qhead++];
+      Lit false_lit = MAKE_LIT (LIT_VAR (p), !LIT_SIGN (p));
+      LitVec *ws = &g_watches[lit_index (false_lit)];
+      
+      int i, j;
+      for (i = 0, j = 0; i < ws->size; i++)
+        {
+          Clause *c = g_clauses[ws->data[i]];
+          
+          if (c->size == 1)
+            {
+              ws->data[j++] = ws->data[i];
+              if (val (c->lits[0]) == -1)
+                {
+                  for (int k = i + 1; k < ws->size; k++)
+                    ws->data[j++] = ws->data[k];
+                  ws->size = j;
+                  return c;
+                }
+              continue;
+            }
+
+          if (c->lits[0] == false_lit)
+            {
+              c->lits[0] = c->lits[1];
+              c->lits[1] = false_lit;
+            }
+
+          if (val (c->lits[0]) == 1)
+            {
+              ws->data[j++] = ws->data[i];
+              continue;
+            }
+
+          bool found_new_watch = false;
+          for (int k = 2; k < c->size; k++)
+            {
+              if (val (c->lits[k]) != -1)
+                {
+                  c->lits[1] = c->lits[k];
+                  c->lits[k] = false_lit;
+                  vec_push (&g_watches[lit_index (c->lits[1])], ws->data[i]);
+                  found_new_watch = true;
+                  break;
+                }
+            }
+
+          if (!found_new_watch)
+            {
+              ws->data[j++] = ws->data[i];
+              if (val (c->lits[0]) == -1)
+                {
+                  for (int k = i + 1; k < ws->size; k++)
+                    ws->data[j++] = ws->data[k];
+                  ws->size = j;
+                  
+                  for (int ac = 0; ac < c->size; ac++)
+                    g_vars[LIT_VAR (c->lits[ac])].activity += 1.0;
+                    
+                  return c;
+                }
+              else
+                {
+                  unchecked_enqueue (c->lits[0], c);
+                }
+            }
+        }
+      ws->size = j;
     }
   return NULL;
 }
 
-static int
-compare_versions_desc (const void *a, const void *b)
+static void
+cancel_until (int level)
 {
-  Package *pa = *(Package **)a;
-  Package *pb = *(Package **)b;
-  return bhpkg_vercmp (pb->version, pa->version);
-}
-
-static bool
-check_conflicts (Package **assignment, size_t count)
-{
-  for (size_t i = 0; i < count; i++)
+  if (g_trail_lim.size > level)
     {
-      Package *p = assignment[i];
-      for (size_t j = 0; j < p->conflicts_count; j++)
+      for (int c = g_trail.size - 1; c >= g_trail_lim.data[level]; c--)
         {
-          for (size_t k = 0; k < count; k++)
-            {
-              if (i == k) continue;
-              if (strcmp (assignment[k]->name, p->conflicts[j]) == 0)
-                {
-                  print_err ("Unresolvable conflict detected: '%s' inherently conflicts with '%s'.", p->name, assignment[k]->name);
-                  return false;
-                }
-              for (size_t pc = 0; pc < assignment[k]->provides_count; pc++)
-                {
-                  if (strcmp (assignment[k]->provides[pc], p->conflicts[j]) == 0)
-                    {
-                      print_err ("Unresolvable conflict: '%s' conflicts with provider '%s'.", p->name, assignment[k]->name);
-                      return false;
-                    }
-                }
-            }
+          int v = LIT_VAR (g_trail.data[c]);
+          g_vars[v].assigns = 0;
+          g_vars[v].reason = NULL;
         }
+      g_trail.size = g_trail_lim.data[level];
+      g_trail_lim.size = level;
+      g_qhead = g_trail.size;
     }
-  return true;
 }
 
 static bool
-iterative_sat_solve (Package ***assignment, size_t *assign_count, SatConstraint *initial_req)
+solve_cdcl (void)
 {
-  size_t stack_cap = 4096;
-  StackFrame *stack = xmalloc (stack_cap * sizeof (StackFrame));
-  size_t stack_top = 0;
-  
-  size_t queue_cap = 4096;
-  SatConstraint *queue = xmalloc (queue_cap * sizeof (SatConstraint));
-  size_t q_head = 0, q_tail = 0;
-  
-  size_t assign_cap = 4096;
-  *assignment = xmalloc (assign_cap * sizeof (Package *));
-  *assign_count = 0;
-
-  queue[q_tail++] = *initial_req;
+  g_trail.size = 0;
+  g_trail_lim.size = 0;
+  g_qhead = 0;
 
   while (true)
     {
-      if (q_head == q_tail)
+      Clause *confl = bcp ();
+      if (confl != NULL)
         {
-          bool ok = check_conflicts (*assignment, *assign_count);
-          free (stack);
-          free (queue);
-          return ok;
-        }
-        
-      SatConstraint req = queue[q_head++];
-      Package *existing = find_in_assignment (*assignment, *assign_count, req.name);
-      
-      if (existing)
-        {
-          if (!check_version (existing->version, req.constraint))
-            goto backtrack;
-          continue;
-        }
+          if (g_trail_lim.size == 0)
+            return false;
 
-      if (stack_top >= stack_cap)
-        {
-          stack_cap *= 2;
-          stack = xrealloc (stack, stack_cap * sizeof (StackFrame));
-        }
-
-      StackFrame *frame = &stack[stack_top++];
-      frame->req = req;
-      
-      frame->cands = db_fetch_all_versions (req.name, &frame->cand_count);
-      if (frame->cand_count == 0)
-        frame->cands = db_fetch_providers (req.name, &frame->cand_count);
-
-      qsort (frame->cands, frame->cand_count, sizeof (Package *), compare_versions_desc);
-      frame->cand_idx = 0;
-      frame->old_assign_count = *assign_count;
-
-explore_candidates:
-      if (frame->cand_idx >= frame->cand_count)
-        {
-          free (frame->cands);
-          stack_top--;
-backtrack:
-          if (stack_top == 0)
-            {
-              free (stack);
-              free (queue);
-              return false; 
-            }
-          frame = &stack[stack_top - 1];
-          *assign_count = frame->old_assign_count;
+          int backtrack_level = g_trail_lim.size - 1;
+          cancel_until (backtrack_level);
           
-          q_tail = q_head; 
-          for (size_t i = 0; i < *assign_count; i++)
+          Lit last_dec = g_trail.data[g_trail.size];
+          unchecked_enqueue (MAKE_LIT (LIT_VAR (last_dec), !LIT_SIGN (last_dec)), NULL);
+        }
+      else
+        {
+          int next_var = 0;
+          double max_act = -1;
+          for (int i = 1; i <= g_num_vars; i++)
             {
-              Package *p = (*assignment)[i];
-              for (size_t d = 0; d < p->dep_count; d++)
+              if (g_vars[i].assigns == 0 && g_vars[i].activity > max_act)
                 {
-                  queue[q_tail].name = p->dep_names[d];
-                  queue[q_tail].constraint = p->dep_constraints[d];
-                  q_tail++;
-                }
-              if (!p->is_installed && strcmp (p->type, "source") == 0)
-                {
-                  for (size_t d = 0; d < p->makedep_count; d++)
-                    {
-                      queue[q_tail].name = p->makedep_names[d];
-                      queue[q_tail].constraint = p->makedep_constraints[d];
-                      q_tail++;
-                    }
+                  max_act = g_vars[i].activity;
+                  next_var = i;
                 }
             }
-          goto explore_candidates;
-        }
 
-      Package *cand = frame->cands[frame->cand_idx++];
+          if (next_var == 0)
+            return true;
 
-      if (cand->architecture && strcmp (cand->architecture, "any") != 0 && strcmp (cand->architecture, g_host_arch) != 0)
-        goto explore_candidates;
-
-      if (!check_version (cand->version, frame->req.constraint))
-        goto explore_candidates;
-
-      if (*assign_count >= assign_cap)
-        {
-          assign_cap *= 2;
-          *assignment = xrealloc (*assignment, assign_cap * sizeof (Package *));
-        }
-      (*assignment)[(*assign_count)++] = cand;
-
-      size_t needed = cand->dep_count + (!cand->is_installed && strcmp (cand->type, "source") == 0 ? cand->makedep_count : 0);
-      if (q_tail + needed >= queue_cap)
-        {
-          queue_cap *= 2;
-          queue = xrealloc (queue, queue_cap * sizeof (SatConstraint));
-        }
-
-      for (size_t d = 0; d < cand->dep_count; d++)
-        {
-          queue[q_tail].name = cand->dep_names[d];
-          queue[q_tail].constraint = cand->dep_constraints[d];
-          q_tail++;
-        }
-        
-      if (!cand->is_installed && strcmp (cand->type, "source") == 0)
-        {
-          for (size_t d = 0; d < cand->makedep_count; d++)
-            {
-              queue[q_tail].name = cand->makedep_names[d];
-              queue[q_tail].constraint = cand->makedep_constraints[d];
-              q_tail++;
-            }
+          vec_push (&g_trail_lim, g_trail.size);
+          unchecked_enqueue (MAKE_LIT (next_var, 0), NULL);
         }
     }
 }
@@ -282,14 +298,14 @@ static void
 kahn_topological_sort (Package **assignment, size_t count, BuildList *order)
 {
   int *in_degree = calloc (count, sizeof (int));
-  int **adj = malloc (count * sizeof (int *));
+  int **adj = xmalloc (count * sizeof (int *));
   int *adj_count = calloc (count, sizeof (int));
   int *adj_cap = calloc (count, sizeof (int));
-  
+
   for (size_t i = 0; i < count; i++)
     {
       adj_cap[i] = 4;
-      adj[i] = malloc (adj_cap[i] * sizeof (int));
+      adj[i] = xmalloc (adj_cap[i] * sizeof (int));
     }
 
   for (size_t i = 0; i < count; i++)
@@ -299,23 +315,23 @@ kahn_topological_sort (Package **assignment, size_t count, BuildList *order)
         {
           Package *dep = assignment[j];
           if (i == j) continue;
-          
+
           bool is_dep = false;
           for (size_t d = 0; d < p->dep_count; d++)
             if (strcmp (p->dep_names[d], dep->name) == 0) is_dep = true;
-            
+
           if (!p->is_installed && strcmp (p->type, "source") == 0)
             {
               for (size_t d = 0; d < p->makedep_count; d++)
                 if (strcmp (p->makedep_names[d], dep->name) == 0) is_dep = true;
             }
-            
+
           if (is_dep)
             {
               if (adj_count[j] >= adj_cap[j])
                 {
                   adj_cap[j] *= 2;
-                  adj[j] = realloc (adj[j], adj_cap[j] * sizeof (int));
+                  adj[j] = xrealloc (adj[j], adj_cap[j] * sizeof (int));
                 }
               adj[j][adj_count[j]++] = i;
               in_degree[i]++;
@@ -323,7 +339,7 @@ kahn_topological_sort (Package **assignment, size_t count, BuildList *order)
         }
     }
 
-  int *queue = malloc (count * sizeof (int));
+  int *queue = xmalloc (count * sizeof (int));
   int head = 0, tail = 0;
 
   for (size_t i = 0; i < count; i++)
@@ -336,7 +352,7 @@ kahn_topological_sort (Package **assignment, size_t count, BuildList *order)
     {
       int u = queue[head++];
       build_list_add (order, assignment[u]);
-      
+
       for (int i = 0; i < adj_count[u]; i++)
         {
           int v = adj[u][i];
@@ -353,33 +369,249 @@ kahn_topological_sort (Package **assignment, size_t count, BuildList *order)
   free (adj_cap);
 }
 
+static bool
+eval_constraint (const char *ver, const char *constraint)
+{
+  if (!constraint || !*constraint)
+    return true;
+
+  const char *op = constraint;
+  const char *val = constraint;
+  while (*val == '<' || *val == '>' || *val == '=')
+    val++;
+
+  int cmp = bhpkg_vercmp (ver, val);
+
+  if (strncmp (op, ">=", 2) == 0) return cmp >= 0;
+  if (strncmp (op, "<=", 2) == 0) return cmp <= 0;
+  if (strncmp (op, "==", 2) == 0 || strncmp (op, "=", 1) == 0) return cmp == 0;
+  if (strncmp (op, ">", 1) == 0) return cmp > 0;
+  if (strncmp (op, "<", 1) == 0) return cmp < 0;
+
+  return true;
+}
+
 int
 resolve_dependencies (Package *root, BuildList *build_order)
 {
-  Package **assignment = NULL;
-  size_t assign_count = 0;
-  SatConstraint req = { root->name, "" };
+  arena_init ();
 
-  if (!iterative_sat_solve (&assignment, &assign_count, &req))
+  PkgList u;
+  u.count = 0;
+  u.cap = 64;
+  u.pkgs = xmalloc (u.cap * sizeof (Package *));
+
+  u.pkgs[u.count++] = root;
+
+  int qhead = 0;
+  while (qhead < u.count)
     {
-      print_err ("Dependency resolution failed for '%s'. Unmet constraints or conflicts.", root->name);
-      if (assignment) free (assignment);
+      Package *p = u.pkgs[qhead++];
+      
+      char **names[] = { p->dep_names, p->makedep_names };
+      size_t counts[] = { p->dep_count, p->makedep_count };
+      
+      for (int t = 0; t < 2; t++)
+        {
+          if (t == 1 && (p->is_installed || strcmp (p->type, "source") != 0))
+            continue;
+              
+          for (size_t i = 0; i < counts[t]; i++)
+            {
+              size_t cand_c;
+              Package **cands = db_fetch_all_versions (names[t][i], &cand_c);
+              for (size_t j = 0; j < cand_c; j++)
+                {
+                  bool found = false;
+                  for (int k = 0; k < u.count; k++)
+                    {
+                      if (u.pkgs[k] == cands[j])
+                        {
+                          found = true;
+                          break;
+                        }
+                    }
+                  if (!found)
+                    {
+                      if (u.count == u.cap)
+                        {
+                          u.cap *= 2;
+                          u.pkgs = xrealloc (u.pkgs, u.cap * sizeof (Package *));
+                        }
+                      u.pkgs[u.count++] = cands[j];
+                    }
+                }
+              free (cands);
+              
+              cands = db_fetch_providers (names[t][i], &cand_c);
+              for (size_t j = 0; j < cand_c; j++)
+                {
+                  bool found = false;
+                  for (int k = 0; k < u.count; k++)
+                    {
+                      if (u.pkgs[k] == cands[j])
+                        {
+                          found = true;
+                          break;
+                        }
+                    }
+                  if (!found)
+                    {
+                      if (u.count == u.cap)
+                        {
+                          u.cap *= 2;
+                          u.pkgs = xrealloc (u.pkgs, u.cap * sizeof (Package *));
+                        }
+                      u.pkgs[u.count++] = cands[j];
+                    }
+                }
+              free (cands);
+            }
+        }
+    }
+
+  g_num_vars = u.count;
+  g_vars = arena_alloc ((g_num_vars + 1) * sizeof (VarData));
+  g_watches = arena_alloc (((g_num_vars + 1) * 2) * sizeof (LitVec));
+  g_pkg_map = arena_alloc ((g_num_vars + 1) * sizeof (Package *));
+
+  for (int i = 0; i <= g_num_vars; i++)
+    {
+      g_vars[i].assigns = 0;
+      g_vars[i].activity = 1.0;
+      g_pkg_map[i] = NULL;
+    }
+    
+  for (int i = 0; i < ((g_num_vars + 1) * 2); i++)
+    {
+      g_watches[i].size = 0;
+      g_watches[i].cap = 0;
+      g_watches[i].data = NULL;
+    }
+
+  for (int i = 0; i < u.count; i++)
+    {
+      g_pkg_map[i + 1] = u.pkgs[i];
+    }
+
+  g_trail.size = 0; g_trail.cap = 0; g_trail.data = NULL;
+  g_trail_lim.size = 0; g_trail_lim.cap = 0; g_trail_lim.data = NULL;
+  g_num_clauses = 0; g_cap_clauses = 0; g_clauses = NULL;
+
+  Lit root_clause[1] = { MAKE_LIT (1, 0) };
+  add_clause (root_clause, 1);
+
+  for (int i = 1; i <= g_num_vars; i++)
+    {
+      Package *p = g_pkg_map[i];
+      char **names[] = { p->dep_names, p->makedep_names };
+      char **constraints[] = { p->dep_constraints, p->makedep_constraints };
+      size_t counts[] = { p->dep_count, p->makedep_count };
+      
+      for (int t = 0; t < 2; t++)
+        {
+          if (t == 1 && (p->is_installed || strcmp (p->type, "source") != 0))
+            continue;
+              
+          for (size_t j = 0; j < counts[t]; j++)
+            {
+              Lit *clause = arena_alloc ((g_num_vars + 1) * sizeof (Lit));
+              int c_size = 0;
+              clause[c_size++] = MAKE_LIT (i, 1);
+              
+              for (int k = 1; k <= g_num_vars; k++)
+                {
+                  Package *cand = g_pkg_map[k];
+                  bool match = false;
+                  if (strcmp (cand->name, names[t][j]) == 0)
+                    {
+                      match = eval_constraint (cand->version, constraints[t][j]);
+                    }
+                  else
+                    {
+                      for (size_t pidx = 0; pidx < cand->provides_count; pidx++)
+                        {
+                          if (strcmp (cand->provides[pidx], names[t][j]) == 0)
+                            {
+                              match = true;
+                              break;
+                            }
+                        }
+                    }
+                  if (match)
+                    {
+                      clause[c_size++] = MAKE_LIT (k, 0);
+                    }
+                }
+              
+              add_clause (clause, c_size);
+            }
+        }
+
+      for (size_t j = 0; j < p->conflicts_count; j++)
+        {
+          for (int k = 1; k <= g_num_vars; k++)
+            {
+              if (i == k) continue;
+              Package *cand = g_pkg_map[k];
+              bool conflict = false;
+              
+              if (strcmp (cand->name, p->conflicts[j]) == 0)
+                conflict = true;
+              else
+                {
+                  for (size_t pidx = 0; pidx < cand->provides_count; pidx++)
+                    {
+                      if (strcmp (cand->provides[pidx], p->conflicts[j]) == 0)
+                        {
+                          conflict = true;
+                          break;
+                        }
+                    }
+                }
+              
+              if (conflict)
+                {
+                  Lit clause[2] = { MAKE_LIT (i, 1), MAKE_LIT (k, 1) };
+                  add_clause (clause, 2);
+                }
+            }
+        }
+    }
+
+  print_msg ("Solving dependency graph...");
+
+  if (!solve_cdcl ())
+    {
+      print_err ("Dependency resolution failed. Conflicting or missing constraints.");
+      arena_free_all ();
+      free (u.pkgs);
       return -1;
+    }
+
+  Package **assignment = xmalloc (g_num_vars * sizeof (Package *));
+  size_t assign_count = 0;
+
+  for (int i = 1; i <= g_num_vars; i++)
+    {
+      if (g_vars[i].assigns == 1 && g_pkg_map[i])
+        assignment[assign_count++] = g_pkg_map[i];
     }
 
   kahn_topological_sort (assignment, assign_count, build_order);
 
-  /* Process Obsoletes */
   for (size_t i = 0; i < assign_count; i++)
     {
       for (size_t j = 0; j < assignment[i]->obsoletes_count; j++)
         {
-          print_warn ("'%s' obsoletes '%s'. Marking '%s' for automatic removal.", 
+          print_warn ("'%s' obsoletes '%s'. Marking '%s' for automatic removal.",
                       assignment[i]->name, assignment[i]->obsoletes[j], assignment[i]->obsoletes[j]);
           db_remove_package (assignment[i]->obsoletes[j]);
         }
     }
 
   free (assignment);
+  arena_free_all ();
+  free (u.pkgs);
   return 0;
 }

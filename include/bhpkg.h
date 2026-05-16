@@ -8,6 +8,8 @@
 #include <limits.h>
 #include <stdint.h>
 #include <setjmp.h>
+#include <sqlite3.h>
+#include <curl/curl.h>
 
 #define C_CYN "\033[1;36m"
 #define C_RED "\033[1;31m"
@@ -49,7 +51,6 @@ typedef struct
   char **makedep_constraints;
   size_t makedep_count;
 
-  /* Virtual Packages, Conflicts, and Rollbacks */
   char **provides;
   size_t provides_count;
   char **conflicts;
@@ -75,6 +76,9 @@ typedef struct
   bool net_access;
   bool is_delta;
   char *base_package_name;
+  
+  /* Atomic Staging Paths */
+  char staging_dir[PATH_MAX];
 } Package;
 
 typedef struct
@@ -99,6 +103,16 @@ typedef struct
   int priority;
 } RepoConfig;
 
+typedef enum 
+{ 
+  RES_FD, 
+  RES_DIR, 
+  RES_SQLITE, 
+  RES_CURL, 
+  RES_PTR 
+} 
+ResType;
+
 extern int g_verbosity;
 extern bool g_pacman_mode;
 extern volatile sig_atomic_t g_interrupted;
@@ -113,7 +127,10 @@ extern size_t g_use_flag_count;
 /* OOM Handling and recovery */
 extern sigjmp_buf g_oom_env;
 extern void *g_oom_pool;
+
 void init_oom_pool (void);
+void track_resource (ResType type, void *ptr, int fd);
+void untrack_resource (ResType type, void *ptr, int fd);
 
 /* version.c */
 int bhpkg_vercmp (const char *val, const char *ref);
@@ -151,8 +168,11 @@ bool archive_compress (const char *src_dir, const char *dest_archive);
 
 /* db.c */
 void db_init (void);
-void db_rollback (void);
 void db_close (void);
+void db_rollback (void);
+void db_begin_transaction (void);
+void db_commit_transaction (void);
+void db_rollback_transaction (void);
 bool db_sync_repo (void);
 Package *db_fetch_manifest (const char *name, const char *target_version);
 Package **db_fetch_all_versions (const char *name, size_t *count_out);
@@ -170,7 +190,9 @@ void db_reconstruct_to_staging (const char *pkg_name, const char *staging_dir);
 
 /* build.c */
 bool build_package (Package *pkg);
-bool install_artifact (Package *pkg);
+bool stage_artifact (Package *pkg);
+bool commit_artifact (Package *pkg);
+void rollback_filesystem (void);
 void run_hook_script (const char *script_body, const char *hook_name);
 void apply_delta_rm_manifest (const char *staging_dir);
 

@@ -7,28 +7,107 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <errno.h>
 #include "bhpkg.h"
 
 void *g_oom_pool = NULL;
 sigjmp_buf g_oom_env;
 
+typedef struct ArenaChunk
+{
+  size_t capacity;
+  size_t used;
+  uint8_t *data;
+  struct ArenaChunk *next;
+} ArenaChunk;
+
+typedef struct
+{
+  ArenaChunk *head;
+} Arena;
+
+static Arena g_sat_arena = { NULL };
+
 void
 init_oom_pool (void)
 {
-  g_oom_pool = malloc (16 * 1024 * 1024);
+  g_sat_arena.head = NULL;
 }
 
-static void
-trigger_oom_panic (void)
+void
+track_resource (ResType type, void *ptr, int fd)
 {
-  if (g_oom_pool)
+  (void) type;
+  (void) ptr;
+  (void) fd;
+}
+
+void
+untrack_resource (ResType type, void *ptr, int fd)
+{
+  (void) type;
+  (void) ptr;
+  (void) fd;
+}
+
+void
+arena_init (void)
+{
+  g_sat_arena.head = NULL;
+}
+
+void *
+arena_alloc (size_t size)
+{
+  ArenaChunk *chunk = g_sat_arena.head;
+  size_t aligned_size = (size + 7) & ~7;
+
+  if (!chunk || chunk->used + aligned_size > chunk->capacity)
     {
-      free (g_oom_pool);
-      g_oom_pool = NULL;
+      size_t new_cap = 1024 * 1024 * 4; 
+      if (aligned_size > new_cap)
+        new_cap = aligned_size;
+
+      ArenaChunk *new_chunk = malloc (sizeof (ArenaChunk));
+      if (!new_chunk)
+        {
+          print_err ("CRITICAL: Arena OOM. Triggering safe rollback.");
+          siglongjmp (g_oom_env, 1);
+        }
+
+      new_chunk->data = malloc (new_cap);
+      if (!new_chunk->data)
+        {
+          free (new_chunk);
+          print_err ("CRITICAL: Arena Data OOM. Triggering safe rollback.");
+          siglongjmp (g_oom_env, 1);
+        }
+
+      new_chunk->capacity = new_cap;
+      new_chunk->used = 0;
+      new_chunk->next = g_sat_arena.head;
+      g_sat_arena.head = new_chunk;
+      chunk = new_chunk;
     }
-  print_err ("CRITICAL: Out of memory! Emergency pool released. Rolling back transaction...");
-  siglongjmp (g_oom_env, 1);
+
+  void *ptr = chunk->data + chunk->used;
+  chunk->used += aligned_size;
+  return ptr;
+}
+
+void
+arena_free_all (void)
+{
+  ArenaChunk *chunk = g_sat_arena.head;
+  while (chunk)
+    {
+      ArenaChunk *next = chunk->next;
+      free (chunk->data);
+      free (chunk);
+      chunk = next;
+    }
+  g_sat_arena.head = NULL;
 }
 
 void *
@@ -36,7 +115,10 @@ xmalloc (size_t size)
 {
   void *ptr = malloc (size);
   if (UNLIKELY (!ptr && size != 0))
-    trigger_oom_panic ();
+    {
+      print_err ("CRITICAL: Standard allocation failed. Triggering safe rollback.");
+      siglongjmp (g_oom_env, 1);
+    }
   return ptr;
 }
 
@@ -45,17 +127,25 @@ xrealloc (void *ptr, size_t size)
 {
   void *new_ptr = realloc (ptr, size);
   if (UNLIKELY (!new_ptr && size != 0))
-    trigger_oom_panic ();
+    {
+      print_err ("CRITICAL: Reallocation failed. Triggering safe rollback.");
+      siglongjmp (g_oom_env, 1);
+    }
   return new_ptr;
 }
 
 char *
 xstrdup (const char *s)
 {
-  if (!s) return NULL;
+  if (!s)
+    return NULL;
+
   char *dup = strdup (s);
   if (UNLIKELY (!dup))
-    trigger_oom_panic ();
+    {
+      print_err ("CRITICAL: String duplication OOM. Triggering safe rollback.");
+      siglongjmp (g_oom_env, 1);
+    }
   return dup;
 }
 
@@ -91,7 +181,8 @@ is_use_flag_enabled (const char *flag)
 void
 print_msg (const char *msg, ...)
 {
-  if (g_verbosity < 1) return;
+  if (g_verbosity < 1)
+    return;
   va_list args;
   printf ("%s==>%s %s", C_CYN, C_RST, C_BLD);
   va_start (args, msg);
@@ -128,26 +219,28 @@ safe_exec (char *const argv[])
   pid_t pid = fork ();
   int status;
 
-  if (pid < 0) return false;
+  if (pid < 0)
+    return false;
+
   if (pid == 0)
     {
       execvp (argv[0], argv);
       exit (127);
     }
-    
+
   waitpid (pid, &status, 0);
   return WIFEXITED (status) && WEXITSTATUS (status) == 0;
 }
 
-/* Zero-copy file copy utilizing copy_file_range syscall */
 bool
 zero_copy_file (const char *src, const char *dst, mode_t mode)
 {
   int fd_in = open (src, O_RDONLY | O_CLOEXEC | O_NOATIME);
-  if (fd_in < 0 && errno == EPERM) fd_in = open (src, O_RDONLY | O_CLOEXEC);
-  
+  if (fd_in < 0 && errno == EPERM)
+    fd_in = open (src, O_RDONLY | O_CLOEXEC);
+
   int fd_out = open (dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
-  
+
   if (fd_in < 0 || fd_out < 0)
     {
       if (fd_in >= 0) close (fd_in);
@@ -163,7 +256,7 @@ zero_copy_file (const char *src, const char *dst, mode_t mode)
       close (fd_out);
       return false;
     }
-  
+
   size_t len = sb.st_size;
 
 #if defined(POSIX_FADV_SEQUENTIAL)
@@ -181,10 +274,12 @@ zero_copy_file (const char *src, const char *dst, mode_t mode)
           if (write (fd_out, buf, bytes_read) < 0) break;
           len -= bytes_read;
         }
-      else if (ret == 0) break;
-      else len -= ret;
+      else if (ret == 0)
+        break;
+      else
+        len -= ret;
     }
-    
+
   fsync (fd_out);
   close (fd_in);
   close (fd_out);
@@ -194,8 +289,9 @@ zero_copy_file (const char *src, const char *dst, mode_t mode)
 void
 package_free (Package *p)
 {
-  if (!p) return;
-  
+  if (!p)
+    return;
+
   if (p->name) free (p->name);
   if (p->version) free (p->version);
   if (p->architecture) free (p->architecture);
@@ -208,19 +304,21 @@ package_free (Package *p)
   if (p->pre_remove) free (p->pre_remove);
   if (p->post_remove) free (p->post_remove);
   if (p->base_package_name) free (p->base_package_name);
-  
+
   if (p->sources)
     {
-      for (size_t j = 0; j < p->num_sources; j++) if (p->sources[j]) free (p->sources[j]);
+      for (size_t j = 0; j < p->num_sources; j++)
+        if (p->sources[j]) free (p->sources[j]);
       free (p->sources);
     }
-    
+
   if (p->hashes)
     {
-      for (size_t j = 0; j < p->num_sources; j++) if (p->hashes[j]) free (p->hashes[j]);
+      for (size_t j = 0; j < p->num_sources; j++)
+        if (p->hashes[j]) free (p->hashes[j]);
       free (p->hashes);
     }
-    
+
   if (p->dep_names)
     {
       for (size_t j = 0; j < p->dep_count; j++)
@@ -231,7 +329,7 @@ package_free (Package *p)
       free (p->dep_names);
       free (p->dep_constraints);
     }
-    
+
   if (p->makedep_names)
     {
       for (size_t j = 0; j < p->makedep_count; j++)
@@ -245,22 +343,25 @@ package_free (Package *p)
 
   if (p->provides)
     {
-      for (size_t j = 0; j < p->provides_count; j++) if (p->provides[j]) free (p->provides[j]);
+      for (size_t j = 0; j < p->provides_count; j++)
+        if (p->provides[j]) free (p->provides[j]);
       free (p->provides);
     }
 
   if (p->conflicts)
     {
-      for (size_t j = 0; j < p->conflicts_count; j++) if (p->conflicts[j]) free (p->conflicts[j]);
+      for (size_t j = 0; j < p->conflicts_count; j++)
+        if (p->conflicts[j]) free (p->conflicts[j]);
       free (p->conflicts);
     }
 
   if (p->obsoletes)
     {
-      for (size_t j = 0; j < p->obsoletes_count; j++) if (p->obsoletes[j]) free (p->obsoletes[j]);
+      for (size_t j = 0; j < p->obsoletes_count; j++)
+        if (p->obsoletes[j]) free (p->obsoletes[j]);
       free (p->obsoletes);
     }
-    
+
   if (p->subpackages)
     {
       for (size_t i = 0; i < p->subpkg_count; i++)
@@ -272,6 +373,6 @@ package_free (Package *p)
         }
       free (p->subpackages);
     }
-    
+
   free (p);
 }
