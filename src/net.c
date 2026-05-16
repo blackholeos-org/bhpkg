@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +15,49 @@ struct XferInfo
   char name[128];
   double dl_total;
   double dl_now;
+  char dest_path[PATH_MAX];
+  char **mirrors;
+  size_t mirror_count;
+  size_t current_mirror;
+  const char *expected_hash;
 };
+
+static void
+parse_pipe_list (const char *str, char ***arr_out, size_t *count_out)
+{
+  char *copy, *tok;
+  size_t count = 0;
+
+  if (!str || !*str)
+    {
+      *count_out = 0;
+      *arr_out = NULL;
+      return;
+    }
+    
+  copy = xstrdup (str);
+  for (char *c = copy; *c; c++)
+    if (*c == '|') count++;
+    
+  count++;
+  
+  *arr_out = xmalloc (count * sizeof (char *));
+  tok = strtok (copy, "|");
+  count = 0;
+  
+  while (tok)
+    {
+      while (*tok == ' ' || *tok == '\t') tok++;
+      char *end = tok + strlen (tok) - 1;
+      while (end > tok && (*end == ' ' || *end == '\t')) *end-- = '\0';
+      
+      (*arr_out)[count++] = xstrdup (tok);
+      tok = strtok (NULL, "|");
+    }
+    
+  *count_out = count;
+  free (copy);
+}
 
 static int
 progress_cb (void *p, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow)
@@ -72,30 +113,30 @@ net_download_all (BuildList *list)
           char fn[PATH_MAX];
           snprintf (fn, sizeof (fn), "/var/lib/bhpkg/tmp/%s-%s-%zu.src", list->pkgs[i]->name, list->pkgs[i]->version, j);
           
-          snprintf (infos[idx].name, sizeof (infos[idx].name), "%s (src %zu)", list->pkgs[i]->name, j + 1);
+          snprintf (infos[idx].name, sizeof (infos[idx].name), "%s", list->pkgs[i]->name);
+          snprintf (infos[idx].dest_path, sizeof (infos[idx].dest_path), "%s", fn);
           infos[idx].dl_total = 0;
-          infos[idx].dl_now = 0;
+          infos[idx].dl_now = 0;          
+          infos[idx].expected_hash = list->pkgs[i]->hashes ? list->pkgs[i]->hashes[j] : NULL;
+
+          parse_pipe_list (list->pkgs[i]->sources[j], &infos[idx].mirrors, &infos[idx].mirror_count);
+          infos[idx].current_mirror = 0;
 
           files[idx] = fopen (fn, "wbe");
           if (files[idx])
-            {
-              fchmod (fileno (files[idx]), 0644);
-            }
+            fchmod (fileno (files[idx]), 0644);
 
           curls[idx] = curl_easy_init ();
-          curl_easy_setopt (curls[idx], CURLOPT_URL, list->pkgs[i]->sources[j]);
+          curl_easy_setopt (curls[idx], CURLOPT_URL, infos[idx].mirrors[0]);
           curl_easy_setopt (curls[idx], CURLOPT_WRITEDATA, files[idx]);
           curl_easy_setopt (curls[idx], CURLOPT_FOLLOWLOCATION, 1L);
           curl_easy_setopt (curls[idx], CURLOPT_MAXREDIRS, 10L);
           curl_easy_setopt (curls[idx], CURLOPT_FAILONERROR, 1L);
-          
           curl_easy_setopt (curls[idx], CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
           curl_easy_setopt (curls[idx], CURLOPT_USERAGENT, "bhpkg/1.0 (Blackhole OS)");
-
           curl_easy_setopt (curls[idx], CURLOPT_XFERINFOFUNCTION, progress_cb);
           curl_easy_setopt (curls[idx], CURLOPT_XFERINFODATA, &infos[idx]);
           curl_easy_setopt (curls[idx], CURLOPT_NOPROGRESS, 0L);
-
           curl_easy_setopt (curls[idx], CURLOPT_CAINFO, SSL_CERT_PATH);
           curl_easy_setopt (curls[idx], CURLOPT_TCP_FASTOPEN, 1L);
           curl_easy_setopt (curls[idx], CURLOPT_TCP_KEEPALIVE, 1L);
@@ -107,7 +148,7 @@ net_download_all (BuildList *list)
     }
 
   if (g_verbosity >= 1)
-    printf ("\033[?25l"); /* Hide cursor */
+    printf ("\033[?25l"); 
 
   while (running && !g_interrupted)
     {
@@ -134,67 +175,129 @@ net_download_all (BuildList *list)
           int pos = (current_percent * bar_width) / 100;
           
           printf ("\r%s==>%s Fetching %zu sources... [", C_CYN, C_RST, total_downloads);
-          
-          /* I Love Candy ;) */
           if (g_pacman_mode)
             {
               for (int j = 0; j < bar_width; j++)
                 {
-                  if (j < pos)
-                    printf ("-");
-                  else if (j == pos)
-                    printf ("%c", (current_percent % 2 == 0) ? 'C' : 'c');
-                  else if (j % 2 == 0)
-                    printf ("o");
-                  else
-                    printf (" ");
+                  if (j < pos) printf ("-");
+                  else if (j == pos) printf ("%c", (current_percent % 2 == 0) ? 'C' : 'c');
+                  else if (j % 2 == 0) printf ("o");
+                  else printf (" ");
                 }
             }
           else
             {
               for (int j = 0; j < bar_width; j++)
                 {
-                  if (j < pos)
-                    printf ("#");
-                  else
-                    printf ("-");
+                  if (j < pos) printf ("#");
+                  else printf ("-");
                 }
             }
-            
           printf ("] %3.0f%%\033[K", percent);
           fflush (stdout);
           last_percent = current_percent;
         }
+        
+      int msgs_left;
+      CURLMsg *msg;
+      bool handle_retried = false;
+
+      while ((msg = curl_multi_info_read (multi, &msgs_left))) 
+        {
+          if (msg->msg == CURLMSG_DONE) 
+            {
+              size_t i;
+              for (i = 0; i < total_downloads; i++) 
+                if (curls[i] == msg->easy_handle) break;
+
+              bool success = (msg->data.result == CURLE_OK);
+
+              if (success)
+                {
+                  if (files[i])
+                    {
+                      fclose (files[i]);
+                      files[i] = NULL;
+                    }
+
+                  bool hash_ok = false;
+                  
+                  if (infos[i].expected_hash && infos[i].expected_hash[0] != '\0')
+                    {
+                      char *hash_copy = xstrdup (infos[i].expected_hash);
+                      char *tok = strtok (hash_copy, "|");
+                      while (tok)
+                        {
+                          while (*tok == ' ' || *tok == '\t') tok++;
+                          char *end = tok + strlen (tok) - 1;
+                          while (end > tok && (*end == ' ' || *end == '\t')) *end-- = '\0';
+
+                          if (crypto_verify_sha256 (infos[i].dest_path, tok))
+                            {
+                              hash_ok = true;
+                              break;
+                            }
+                          tok = strtok (NULL, "|");
+                        }
+                      free (hash_copy);
+                    }
+                  else
+                    {
+                      hash_ok = true; /* Skip verification for dynamic files without hashes */
+                    }
+
+                  if (!hash_ok)
+                    {
+                      if (g_verbosity >= 1) printf ("\r\033[K");
+                      print_warn ("Hash mismatch for '%s' on %s. Suspected mirror desync.", 
+                                  infos[i].name, infos[i].mirrors[infos[i].current_mirror]);
+                      success = false; /* Force failover */
+                    }
+                }
+
+              if (!success)
+                {
+                  if (infos[i].current_mirror + 1 < infos[i].mirror_count)
+                    {
+                      infos[i].current_mirror++;
+                      if (g_verbosity >= 1) printf ("\r\033[K");
+                      print_warn ("Falling back to: %s", infos[i].mirrors[infos[i].current_mirror]);
+                      
+                      curl_multi_remove_handle (multi, curls[i]);
+                      if (files[i]) fclose (files[i]);
+                      
+                      files[i] = fopen (infos[i].dest_path, "wbe");
+                      if (files[i]) fchmod (fileno (files[i]), 0644);
+                      
+                      curl_easy_setopt (curls[i], CURLOPT_URL, infos[i].mirrors[infos[i].current_mirror]);
+                      curl_easy_setopt (curls[i], CURLOPT_WRITEDATA, files[i]);
+                      curl_multi_add_handle (multi, curls[i]);
+                      handle_retried = true;
+                    }
+                  else
+                    {
+                      if (g_verbosity >= 1) printf ("\r\033[K");
+                      print_err ("All mirrors exhausted or failed integrity checks for '%s'.", infos[i].name);
+                      if (msg->data.result != CURLE_OK)
+                        print_err ("cURL Error: %s", curl_easy_strerror (msg->data.result));
+                      download_failed = true;
+                    }
+                }
+              else
+                {
+                   if (g_verbosity >= 1 && infos[i].expected_hash)
+                     printf ("\r\033[K  %s[PASS]%s %s\n", C_GRN, C_RST, infos[i].name);
+                }
+            }
+        }
+      if (handle_retried) running = 1;
     }
     
   if (g_verbosity >= 1)
     {
       printf ("\r%s==>%s Fetching %zu sources... [", C_CYN, C_RST, total_downloads);
       for (int j = 0; j < bar_width; j++) printf (g_pacman_mode ? "-" : "#");
-      printf ("] 100%%\033[K\n");
-      printf ("\033[?25h"); /* Show cursor */
-    }
-
-  int msgs_left;
-  CURLMsg *msg;
-  while ((msg = curl_multi_info_read (multi, &msgs_left))) 
-    {
-      if (msg->msg == CURLMSG_DONE) 
-        {
-          if (msg->data.result != CURLE_OK) 
-            {
-              for (size_t i = 0; i < total_downloads; i++) 
-                {
-                  if (curls[i] == msg->easy_handle) 
-                    {
-                      print_err ("Network error downloading '%s': %s", 
-                                 infos[i].name, curl_easy_strerror (msg->data.result));
-                      break;
-                    }
-                }
-              download_failed = true;
-            }
-        }
+      printf ("] 100%%\033[K\n\033[?25h"); 
     }
 
   idx = 0;
@@ -208,10 +311,12 @@ net_download_all (BuildList *list)
             fclose (files[idx]);
           
           if (g_interrupted || download_failed)
+            remove (infos[idx].dest_path);
+
+          if (infos[idx].mirrors)
             {
-              char fn[PATH_MAX];
-              snprintf (fn, sizeof (fn), "/var/lib/bhpkg/tmp/%s-%s-%zu.src", list->pkgs[i]->name, list->pkgs[i]->version, j);
-              remove (fn);
+              for (size_t k = 0; k < infos[idx].mirror_count; k++) free (infos[idx].mirrors[k]);
+              free (infos[idx].mirrors);
             }
           idx++;
         }
