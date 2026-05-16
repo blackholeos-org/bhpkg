@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <limits.h>
 #include <stdint.h>
+#include <setjmp.h>
 
 #define C_CYN "\033[1;36m"
 #define C_RED "\033[1;31m"
@@ -31,6 +32,7 @@ typedef struct
 {
   char *name;
   char *version;
+  char *architecture;
   char *type;
   char *license;
   char *repo_origin;
@@ -46,6 +48,14 @@ typedef struct
   char **makedep_names;
   char **makedep_constraints;
   size_t makedep_count;
+
+  /* Virtual Packages, Conflicts, and Rollbacks */
+  char **provides;
+  size_t provides_count;
+  char **conflicts;
+  size_t conflicts_count;
+  char **obsoletes;
+  size_t obsoletes_count;
   
   SubpackageRule *subpackages;
   size_t subpkg_count;
@@ -61,12 +71,10 @@ typedef struct
   bool is_installed;
   bool is_cached;
   
-  /* Feature Upgrades */
   bool is_subpackage;
   bool net_access;
   bool is_delta;
   char *base_package_name;
-  
 } Package;
 
 typedef struct
@@ -94,12 +102,18 @@ typedef struct
 extern int g_verbosity;
 extern bool g_pacman_mode;
 extern volatile sig_atomic_t g_interrupted;
+extern char g_host_arch[32];
 
 extern RepoConfig *g_repos;
 extern size_t g_repo_count;
 
 extern char **g_use_flags;
 extern size_t g_use_flag_count;
+
+/* OOM Handling and recovery */
+extern sigjmp_buf g_oom_env;
+extern void *g_oom_pool;
+void init_oom_pool (void);
 
 /* version.c */
 int bhpkg_vercmp (const char *val, const char *ref);
@@ -142,6 +156,7 @@ void db_close (void);
 bool db_sync_repo (void);
 Package *db_fetch_manifest (const char *name, const char *target_version);
 Package **db_fetch_all_versions (const char *name, size_t *count_out);
+Package **db_fetch_providers (const char *provides_name, size_t *count_out);
 void db_register_package (Package *pkg, const char *staging_dir);
 bool db_is_required_by_others (const char *pkg_name);
 bool db_remove_package (const char *name);
@@ -161,5 +176,6 @@ void apply_delta_rm_manifest (const char *staging_dir);
 
 /* hook.c */
 void hook_execute_all (const char *operation);
+void hook_evaluate_triggers (const char *staging_dir);
 
 #endif

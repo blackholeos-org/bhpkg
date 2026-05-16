@@ -10,16 +10,33 @@
 #include <errno.h>
 #include "bhpkg.h"
 
+void *g_oom_pool = NULL;
+sigjmp_buf g_oom_env;
+
+void
+init_oom_pool (void)
+{
+  g_oom_pool = malloc (16 * 1024 * 1024);
+}
+
+static void
+trigger_oom_panic (void)
+{
+  if (g_oom_pool)
+    {
+      free (g_oom_pool);
+      g_oom_pool = NULL;
+    }
+  print_err ("CRITICAL: Out of memory! Emergency pool released. Rolling back transaction...");
+  siglongjmp (g_oom_env, 1);
+}
+
 void *
 xmalloc (size_t size)
 {
   void *ptr = malloc (size);
   if (UNLIKELY (!ptr && size != 0))
-    {
-      print_err ("Out of memory! Recovering and rolling back database state.");
-      db_rollback ();
-      exit (EXIT_FAILURE);
-    }
+    trigger_oom_panic ();
   return ptr;
 }
 
@@ -28,11 +45,7 @@ xrealloc (void *ptr, size_t size)
 {
   void *new_ptr = realloc (ptr, size);
   if (UNLIKELY (!new_ptr && size != 0))
-    {
-      print_err ("Out of memory during reallocation! Rolling back.");
-      db_rollback ();
-      exit (EXIT_FAILURE);
-    }
+    trigger_oom_panic ();
   return new_ptr;
 }
 
@@ -42,11 +55,7 @@ xstrdup (const char *s)
   if (!s) return NULL;
   char *dup = strdup (s);
   if (UNLIKELY (!dup))
-    {
-      print_err ("Out of memory allocating string duplicate! Rolling back.");
-      db_rollback ();
-      exit (EXIT_FAILURE);
-    }
+    trigger_oom_panic ();
   return dup;
 }
 
@@ -189,6 +198,7 @@ package_free (Package *p)
   
   if (p->name) free (p->name);
   if (p->version) free (p->version);
+  if (p->architecture) free (p->architecture);
   if (p->type) free (p->type);
   if (p->license) free (p->license);
   if (p->repo_origin) free (p->repo_origin);
@@ -231,6 +241,24 @@ package_free (Package *p)
         }
       free (p->makedep_names);
       free (p->makedep_constraints);
+    }
+
+  if (p->provides)
+    {
+      for (size_t j = 0; j < p->provides_count; j++) if (p->provides[j]) free (p->provides[j]);
+      free (p->provides);
+    }
+
+  if (p->conflicts)
+    {
+      for (size_t j = 0; j < p->conflicts_count; j++) if (p->conflicts[j]) free (p->conflicts[j]);
+      free (p->conflicts);
+    }
+
+  if (p->obsoletes)
+    {
+      for (size_t j = 0; j < p->obsoletes_count; j++) if (p->obsoletes[j]) free (p->obsoletes[j]);
+      free (p->obsoletes);
     }
     
   if (p->subpackages)

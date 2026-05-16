@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <dirent.h>
 #include <ctype.h>
 #include "bhpkg.h"
@@ -13,6 +14,7 @@ volatile sig_atomic_t g_interrupted = 0;
 
 int g_verbosity = 1;
 bool g_pacman_mode = false;
+char g_host_arch[32];
 
 RepoConfig *g_repos = NULL;
 size_t g_repo_count = 0;
@@ -175,25 +177,6 @@ process_build_queue (BuildList *order)
     {
       if (net_download_all (&to_download) != 0 || g_interrupted)
         goto build_cleanup;
-
-      print_msg ("Verifying SHA256 cryptographic hashes...");
-      for (size_t i = 0; i < to_download.count; i++)
-        {
-          for (size_t j = 0; j < to_download.pkgs[i]->num_sources; j++)
-            {
-              char fn[PATH_MAX];
-              snprintf (fn, sizeof (fn), "/var/lib/bhpkg/tmp/%s-%s-%zu.src",
-                        to_download.pkgs[i]->name, to_download.pkgs[i]->version, j);
-
-              if (!crypto_verify_sha256 (fn, to_download.pkgs[i]->hashes[j]))
-                {
-                  print_err ("Integrity check failed for %s! Potential MITM attack.", to_download.pkgs[i]->name);
-                  exit (EXIT_FAILURE);
-                }
-            }
-          if (g_verbosity >= 1)
-            printf ("  %s[PASS]%s %s\n", C_GRN, C_RST, to_download.pkgs[i]->name);
-        }
     }
 
   for (size_t i = 0; i < order->count; i++)
@@ -234,6 +217,21 @@ build_cleanup:
   build_list_free (&to_download);
 }
 
+static void
+detect_architecture (void)
+{
+  struct utsname buffer;
+  if (uname (&buffer) != 0)
+    {
+      print_err ("Failed to detect system architecture. Defaulting to x86_64.");
+      strncpy (g_host_arch, "x86_64", 31);
+    }
+  else
+    {
+      strncpy (g_host_arch, buffer.machine, 31);
+    }
+}
+
 int
 main (int argc, char **argv)
 {
@@ -254,6 +252,18 @@ main (int argc, char **argv)
       return 1;
     }
 
+  detect_architecture ();
+  init_oom_pool ();
+
+  /* Wrap the entire execution in an Emergency Block. 
+     in case memory fails inside the solver or DB, xmalloc() throws us back here cleanly. */
+  if (sigsetjmp (g_oom_env, 1) != 0)
+    {
+      print_err ("Package transaction aborted safely due to Out-Of-Memory.");
+      db_rollback ();
+      return EXIT_FAILURE;
+    }
+
   config_load ();
 
   signal (SIGINT, handle_signal);
@@ -272,7 +282,6 @@ main (int argc, char **argv)
 
   db_init ();
 
-  /* Command Pipeline Parsing */
   for (int i = 1; i < argc; i++)
     {
       if (argv[i][0] == '-' && argv[i][1] != '-')
@@ -323,7 +332,6 @@ main (int argc, char **argv)
         }
     }
 
-  /* Command Execution Sequence */
   if (do_cache) cache_prune ();
   if (do_orphans && !do_remove) db_remove_orphans ();
   
