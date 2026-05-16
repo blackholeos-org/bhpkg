@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,9 +102,13 @@ db_sync_repo (void)
 
   if (net_download_all (&sync_list) != 0)
     {
+      for (size_t i = 0; i < sync_list.count; i++)
+        package_free (sync_list.pkgs[i]);
       build_list_free (&sync_list);
       return false;
     }
+
+  bool all_success = true;
 
   for (size_t i = 0; i < g_repo_count; i++)
     {
@@ -118,6 +121,7 @@ db_sync_repo (void)
       if (!zero_copy_file (src_db, dst_db, 0644) || !zero_copy_file (src_sig, dst_sig, 0644))
         {
           print_err ("Failed to move databases to local storage for repo %s.", g_repos[i].name);
+          all_success = false;
           continue;
         }
         
@@ -129,6 +133,7 @@ db_sync_repo (void)
           print_err ("Signature verification failed for repo %s! Untrusted database.", g_repos[i].name);
           unlink (dst_db);
           unlink (dst_sig);
+          all_success = false;
           continue;
         }
 
@@ -140,9 +145,16 @@ db_sync_repo (void)
       print_msg ("Successfully synced repository: %s", g_repos[i].name);
     }
 
+  for (size_t i = 0; i < sync_list.count; i++)
+    package_free (sync_list.pkgs[i]);
   build_list_free (&sync_list);
-  print_msg ("All repositories synchronized successfully.");
-  return true;
+  
+  if (all_success)
+    print_msg ("All repositories synchronized successfully.");
+  else
+    print_err ("One or more repositories failed to synchronize. Aborting.");
+    
+  return all_success;
 }
 
 static void
@@ -179,7 +191,6 @@ parse_comma_list (const char *str, char ***arr_out, size_t *count_out)
   free (copy);
 }
 
-/* Optimized conditional dependency parsing using ? syntax (e.g., "wayland?wayland-protocols") */
 static void
 parse_conditional_deps (const char *str, char ***names_out, char ***constraints_out, size_t *count_out)
 {
@@ -250,6 +261,7 @@ db_fetch_manifest (const char *name, const char *target_version)
   sqlite3_stmt *chk;
   Package *parsed_pkg = NULL;
   char *best_ver = NULL;
+  bool new_schema = true;
 
   if (target_version)
     sql = "SELECT version FROM sync_packages WHERE name = ? AND version = ?";
@@ -282,8 +294,15 @@ db_fetch_manifest (const char *name, const char *target_version)
         }
     }
 
-  sql = "SELECT origin_repo, type, license, sources, hashes, depends, makedepends, build_script, pre_install, post_install, pre_remove, post_remove "
-        "FROM sync_packages WHERE name = ? AND version = ? ORDER BY priority ASC LIMIT 1";
+  if (sqlite3_prepare_v2 (db, "SELECT architecture, provides, conflicts, obsoletes FROM sync_packages LIMIT 1", -1, &chk, NULL) != SQLITE_OK)
+    new_schema = false;
+  else
+    sqlite3_finalize (chk);
+
+  if (new_schema)
+    sql = "SELECT origin_repo, type, license, sources, hashes, depends, makedepends, build_script, pre_install, post_install, pre_remove, post_remove, architecture, provides, conflicts, obsoletes FROM sync_packages WHERE name = ? AND version = ? ORDER BY priority ASC LIMIT 1";
+  else
+    sql = "SELECT origin_repo, type, license, sources, hashes, depends, makedepends, build_script, pre_install, post_install, pre_remove, post_remove FROM sync_packages WHERE name = ? AND version = ? ORDER BY priority ASC LIMIT 1";
         
   if (sqlite3_prepare_v2 (db, sql, -1, &stmt, NULL) == SQLITE_OK)
     {
@@ -327,6 +346,22 @@ db_fetch_manifest (const char *name, const char *target_version)
           parsed_pkg->pre_remove = pre_rm ? xstrdup (pre_rm) : xstrdup ("");
           parsed_pkg->post_remove = post_rm ? xstrdup (post_rm) : xstrdup ("");
           
+          if (new_schema)
+            {
+              const char *arch_col = (const char *) sqlite3_column_text (stmt, 12);
+              parsed_pkg->architecture = xstrdup (arch_col ? arch_col : "any");
+              parse_comma_list ((const char *) sqlite3_column_text (stmt, 13), &parsed_pkg->provides, &parsed_pkg->provides_count);
+              parse_comma_list ((const char *) sqlite3_column_text (stmt, 14), &parsed_pkg->conflicts, &parsed_pkg->conflicts_count);
+              parse_comma_list ((const char *) sqlite3_column_text (stmt, 15), &parsed_pkg->obsoletes, &parsed_pkg->obsoletes_count);
+            }
+          else
+            {
+              parsed_pkg->architecture = xstrdup ("any");
+              parsed_pkg->provides = NULL; parsed_pkg->provides_count = 0;
+              parsed_pkg->conflicts = NULL; parsed_pkg->conflicts_count = 0;
+              parsed_pkg->obsoletes = NULL; parsed_pkg->obsoletes_count = 0;
+            }
+
           parsed_pkg->net_access = false;
           parsed_pkg->is_delta = false;
           parsed_pkg->install_reason = 1;
@@ -392,6 +427,67 @@ db_fetch_all_versions (const char *name, size_t *count_out)
             }
         }
       sqlite3_finalize (stmt);
+    }
+    
+  *count_out = count;
+  return list;
+}
+
+Package **
+db_fetch_providers (const char *provides_name, size_t *count_out)
+{
+  Package **list = NULL;
+  size_t count = 0;
+  size_t capacity = 4;
+  list = xmalloc (capacity * sizeof (Package *));
+  
+  sqlite3_stmt *chk;
+  if (sqlite3_prepare_v2 (db, "SELECT provides FROM sync_packages LIMIT 1", -1, &chk, NULL) != SQLITE_OK)
+    {
+      /* Database schema is outdated, virtual packages impossible */
+      *count_out = 0;
+      return list;
+    }
+  sqlite3_finalize (chk);
+
+  const char *sql = "SELECT name, version FROM sync_packages WHERE provides LIKE ?";
+  sqlite3_stmt *stmt;
+  
+  if (sqlite3_prepare_v2 (db, sql, -1, &stmt, NULL) == SQLITE_OK)
+    {
+      char *like_query = xmalloc (strlen (provides_name) + 3);
+      sprintf (like_query, "%%%s%%", provides_name);
+      sqlite3_bind_text (stmt, 1, like_query, -1, SQLITE_TRANSIENT);
+      
+      while (sqlite3_step (stmt) == SQLITE_ROW)
+        {
+          const char *name = (const char *) sqlite3_column_text (stmt, 0);
+          const char *ver = (const char *) sqlite3_column_text (stmt, 1);
+          Package *pkg = db_fetch_manifest (name, ver);
+          if (pkg)
+            {
+              bool match = false;
+              for (size_t i = 0; i < pkg->provides_count; i++)
+                {
+                  if (strcmp (pkg->provides[i], provides_name) == 0)
+                    {
+                      match = true;
+                      break;
+                    }
+                }
+              if (match)
+                {
+                  if (count >= capacity)
+                    {
+                      capacity *= 2;
+                      list = xrealloc (list, capacity * sizeof (Package *));
+                    }
+                  list[count++] = pkg;
+                }
+            }
+        }
+      sqlite3_finalize (stmt);
+      free (like_query);
     }
     
   *count_out = count;
