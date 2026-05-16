@@ -3,6 +3,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <ctype.h>
+#include <fnmatch.h>
 #include "bhpkg.h"
 
 static void
@@ -70,6 +72,60 @@ hook_execute_all (const char *operation)
           char path[PATH_MAX];
           snprintf (path, sizeof (path), "/etc/bhpkg/hooks/%s", dir->d_name);
           process_hook_file (path, operation);
+        }
+    }
+  closedir (d);
+}
+
+static void
+evaluate_single_hook (const char *hook_path, const char *staging_dir)
+{
+  FILE *f = fopen (hook_path, "r");
+  char line[512], target_pattern[256] = {0}, exec_cmd[256] = {0};
+
+  if (!f) return;
+  while (fgets (line, sizeof (line), f))
+    {
+      char *key = strtok (line, "=");
+      char *val = strtok (NULL, "\n");
+      if (!key || !val) continue;
+
+      strip_whitespace (key);
+      strip_whitespace (val);
+
+      if (strcmp (key, "TriggerOn") == 0) strncpy (target_pattern, val, 255);
+      else if (strcmp (key, "Exec") == 0) strncpy (exec_cmd, val, 255);
+    }
+  fclose (f);
+
+  if (target_pattern[0] && exec_cmd[0])
+    {
+      char cmd[1024];
+      snprintf (cmd, sizeof (cmd), "find %s -path '%s' | grep -q .", staging_dir, target_pattern);
+      if (system (cmd) == 0)
+        {
+          print_msg ("Triggering hook: %s", hook_path);
+          char *const args[] = { "/bin/sh", "-c", exec_cmd, NULL };
+          safe_exec (args);
+        }
+    }
+}
+
+void
+hook_evaluate_triggers (const char *staging_dir)
+{
+  DIR *d = opendir ("/etc/bhpkg/hooks");
+  struct dirent *dir;
+
+  if (!d) return;
+
+  while ((dir = readdir (d)) != NULL)
+    {
+      if (strstr (dir->d_name, ".hook"))
+        {
+          char path[PATH_MAX];
+          snprintf (path, sizeof (path), "/etc/bhpkg/hooks/%s", dir->d_name);
+          evaluate_single_hook (path, staging_dir);
         }
     }
   closedir (d);
