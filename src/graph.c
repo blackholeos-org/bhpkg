@@ -115,7 +115,36 @@ compare_versions_desc (const void *a, const void *b)
   return bhpkg_vercmp (pb->version, pa->version);
 }
 
-/* Iterative DPLL Solver to completely prevent C stack overflow and solve scalable logic constraints */
+static bool
+check_conflicts (Package **assignment, size_t count)
+{
+  for (size_t i = 0; i < count; i++)
+    {
+      Package *p = assignment[i];
+      for (size_t j = 0; j < p->conflicts_count; j++)
+        {
+          for (size_t k = 0; k < count; k++)
+            {
+              if (i == k) continue;
+              if (strcmp (assignment[k]->name, p->conflicts[j]) == 0)
+                {
+                  print_err ("Unresolvable conflict detected: '%s' inherently conflicts with '%s'.", p->name, assignment[k]->name);
+                  return false;
+                }
+              for (size_t pc = 0; pc < assignment[k]->provides_count; pc++)
+                {
+                  if (strcmp (assignment[k]->provides[pc], p->conflicts[j]) == 0)
+                    {
+                      print_err ("Unresolvable conflict: '%s' conflicts with provider '%s'.", p->name, assignment[k]->name);
+                      return false;
+                    }
+                }
+            }
+        }
+    }
+  return true;
+}
+
 static bool
 iterative_sat_solve (Package ***assignment, size_t *assign_count, SatConstraint *initial_req)
 {
@@ -137,9 +166,10 @@ iterative_sat_solve (Package ***assignment, size_t *assign_count, SatConstraint 
     {
       if (q_head == q_tail)
         {
+          bool ok = check_conflicts (*assignment, *assign_count);
           free (stack);
           free (queue);
-          return true; /* All constraints satisfied */
+          return ok;
         }
         
       SatConstraint req = queue[q_head++];
@@ -149,10 +179,9 @@ iterative_sat_solve (Package ***assignment, size_t *assign_count, SatConstraint 
         {
           if (!check_version (existing->version, req.constraint))
             goto backtrack;
-          continue; /* Constraint met */
+          continue;
         }
 
-      /* Create a new branch (Choice Point) */
       if (stack_top >= stack_cap)
         {
           stack_cap *= 2;
@@ -161,7 +190,11 @@ iterative_sat_solve (Package ***assignment, size_t *assign_count, SatConstraint 
 
       StackFrame *frame = &stack[stack_top++];
       frame->req = req;
+      
       frame->cands = db_fetch_all_versions (req.name, &frame->cand_count);
+      if (frame->cand_count == 0)
+        frame->cands = db_fetch_providers (req.name, &frame->cand_count);
+
       qsort (frame->cands, frame->cand_count, sizeof (Package *), compare_versions_desc);
       frame->cand_idx = 0;
       frame->old_assign_count = *assign_count;
@@ -176,12 +209,11 @@ backtrack:
             {
               free (stack);
               free (queue);
-              return false; /* Unsatisfiable */
+              return false; 
             }
           frame = &stack[stack_top - 1];
           *assign_count = frame->old_assign_count;
           
-          /* Re-evaluate queue position */
           q_tail = q_head; 
           for (size_t i = 0; i < *assign_count; i++)
             {
@@ -206,6 +238,10 @@ backtrack:
         }
 
       Package *cand = frame->cands[frame->cand_idx++];
+
+      if (cand->architecture && strcmp (cand->architecture, "any") != 0 && strcmp (cand->architecture, g_host_arch) != 0)
+        goto explore_candidates;
+
       if (!check_version (cand->version, frame->req.constraint))
         goto explore_candidates;
 
@@ -328,10 +364,21 @@ resolve_dependencies (Package *root, BuildList *build_order)
     {
       print_err ("Dependency resolution failed for '%s'. Unmet constraints or conflicts.", root->name);
       if (assignment) free (assignment);
-      exit (EXIT_FAILURE);
+      return -1;
     }
 
   kahn_topological_sort (assignment, assign_count, build_order);
+
+  /* Process Obsoletes */
+  for (size_t i = 0; i < assign_count; i++)
+    {
+      for (size_t j = 0; j < assignment[i]->obsoletes_count; j++)
+        {
+          print_warn ("'%s' obsoletes '%s'. Marking '%s' for automatic removal.", 
+                      assignment[i]->name, assignment[i]->obsoletes[j], assignment[i]->obsoletes[j]);
+          db_remove_package (assignment[i]->obsoletes[j]);
+        }
+    }
 
   free (assignment);
   return 0;
