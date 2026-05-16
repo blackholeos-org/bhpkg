@@ -9,6 +9,7 @@
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <sys/prctl.h>
+#include <sys/xattr.h>
 #include <linux/capability.h>
 #include <errno.h>
 #include <sched.h>
@@ -23,6 +24,10 @@
 
 #ifndef SECCOMP_RET_KILL_PROCESS
 #define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#endif
+
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
 #endif
 
 char g_fakeroot[PATH_MAX];
@@ -119,24 +124,24 @@ ensure_parent_dir (const char *path)
 }
 
 static void
-apply_seccomp_filter (void)
+apply_seccomp (void)
 {
   struct sock_filter filter[] = {
     BPF_STMT (BPF_LD | BPF_W | BPF_ABS, (offsetof (struct seccomp_data, nr))),
     
     BPF_JUMP (BPF_JMP | BPF_JEQ | BPF_K, SYS_ptrace, 0, 1),
     BPF_STMT (BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
-    
     BPF_JUMP (BPF_JMP | BPF_JEQ | BPF_K, SYS_kexec_load, 0, 1),
     BPF_STMT (BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
-    
     BPF_JUMP (BPF_JMP | BPF_JEQ | BPF_K, SYS_init_module, 0, 1),
     BPF_STMT (BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
-    
+    BPF_JUMP (BPF_JMP | BPF_JEQ | BPF_K, SYS_finit_module, 0, 1),
+    BPF_STMT (BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
     BPF_JUMP (BPF_JMP | BPF_JEQ | BPF_K, SYS_bpf, 0, 1),
     BPF_STMT (BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
-    
     BPF_JUMP (BPF_JMP | BPF_JEQ | BPF_K, SYS_unshare, 0, 1),
+    BPF_STMT (BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    BPF_JUMP (BPF_JMP | BPF_JEQ | BPF_K, SYS_mount, 0, 1),
     BPF_STMT (BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
 
     BPF_STMT (BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
@@ -149,9 +154,7 @@ apply_seccomp_filter (void)
   
   prctl (PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
   if (prctl (PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0)
-    {
-      fprintf (stderr, "WARNING: Seccomp BPF filter failed to attach (Errno: %d). Continuing without syscall trapping.\n", errno);
-    }
+    print_warn ("Seccomp BPF filter failed. sandboxing degraded.");
 }
 
 static void
@@ -290,7 +293,7 @@ enter_hermetic_sandbox (const char *builddir, const char *fakeroot, bool net_acc
       exit (127);
     }
   
-  apply_seccomp_filter ();
+  apply_seccomp ();
 }
 
 static Package *g_split_pkg;
@@ -469,7 +472,12 @@ build_package (Package *pkg)
       dprintf (fd_scr, "export USE_%s=%d\n", flag_clean, g_use_flags[i][0] == '-' ? 0 : 1);
     }
 
-  dprintf (fd_scr, "cd \"/build\" || exit 1\nprintf '%%s\\n' \"%s\" | while read -r line; do echo \"+ $line\"; done\n%s\n", pkg->build_script, pkg->build_script);
+  dprintf (fd_scr, 
+    "cd \"/build\" || exit 1\n"
+    "cat << 'BH_EOF' | while read -r line; do echo \"+ $line\"; done\n"
+    "%s\n"
+    "BH_EOF\n"
+    "%s\n", pkg->build_script, pkg->build_script);
   close (fd_scr);
 
   pid = fork ();
@@ -540,7 +548,11 @@ build_package (Package *pkg)
   
   if (!WIFEXITED (status) || WEXITSTATUS (status) != 0 || g_interrupted)
     {
-      print_err ("Build script failed. Check /var/log/bhpkg-build.log for details.");
+      if (g_verbosity < 2)
+        print_err ("Build script failed. Check /var/log/bhpkg-build.log for details.");
+      else
+        print_err ("Build script failed. Check the compilation output above for details.");
+        
       safe_exec (c_clean);
       return false;
     }
@@ -585,6 +597,16 @@ apply_delta_rm_manifest (const char *staging_dir)
     
   fclose (f);
   unlink (manifest);
+}
+
+static void
+apply_security_contexts (const char *fpath)
+{
+  const char *context = "system_u:object_r:bin_t:s0";
+  if (strncmp (fpath, "/etc", 4) == 0)
+    context = "system_u:object_r:etc_t:s0";
+    
+  setxattr (fpath, "security.selinux", context, strlen (context), 0);
 }
 
 static int
@@ -685,18 +707,47 @@ install_cb (const char *fpath, const struct stat *sb, int typeflag, struct FTW *
       return 0;
     }
 
-  unlink (target);
-  if (!zero_copy_file (fpath, target, sb->st_mode))
+  if (lstat (target, &existing_st) == 0)
     {
-      print_err ("Failed to copy extracted file to %s", target);
-      g_install_failed = true;
-      return -1;
+      char tmp_target[PATH_MAX];
+      snprintf (tmp_target, sizeof (tmp_target), "%s.bhpkg-tmp", target);
+      
+      if (!zero_copy_file (fpath, tmp_target, sb->st_mode))
+        {
+          print_err ("Failed to stage extracted file to %s", tmp_target);
+          g_install_failed = true;
+          return -1;
+        }
+        
+      apply_security_contexts (tmp_target);
+      
+      if (syscall (SYS_renameat2, AT_FDCWD, tmp_target, AT_FDCWD, target, RENAME_EXCHANGE) == 0)
+        {
+          unlink (tmp_target);
+          track_written_file (target);
+        }
+      else
+        {
+          unlink (target);
+          rename (tmp_target, target);
+          track_written_file (target);
+        }
+    }
+  else
+    {
+      if (!zero_copy_file (fpath, target, sb->st_mode))
+        {
+          print_err ("Failed to copy extracted file to %s", target);
+          g_install_failed = true;
+          return -1;
+        }
+      apply_security_contexts (target);
+      track_written_file (target);
     }
     
   if (chown (target, 0, 0) != 0 && g_verbosity >= 3)
     print_warn ("Failed to chown %s to root:root", target);
     
-  track_written_file (target);
   return 0;
 }
 
@@ -759,6 +810,7 @@ install_artifact (Package *pkg)
   safe_exec (c_clean);
   hook_execute_all ("Install");
   run_hook_script (pkg->post_install, "post_install");
+  hook_evaluate_triggers (g_staging);
   
   sync ();
   return true;
