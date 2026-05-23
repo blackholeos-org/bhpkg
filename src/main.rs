@@ -24,7 +24,7 @@ pub static SIGNAL_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 #[derive(Parser, Debug)]
 #[command(
     name = "bhpkg",
-    version = "1.0",
+    version = "2.0",
     author = "Blackhole OS",
     about = "Blazing fast, transactional package manager"
 )]

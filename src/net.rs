@@ -110,10 +110,12 @@ fn create_easy(
     easy.fail_on_error(true)
         .map_err(|e| AppError::Net(e.to_string()))?;
 
-    let _ = easy.ssl_verify_peer(false);
-    let _ = easy.ssl_verify_host(false);
+    easy.ssl_verify_peer(true)
+        .map_err(|e| AppError::Net(e.to_string()))?;
+    easy.ssl_verify_host(true)
+        .map_err(|e| AppError::Net(e.to_string()))?;
 
-    easy.useragent("bhpkg/1.0 (Blackhole OS)")
+    easy.useragent("bhpkg/2.0 (Blackhole OS)")
         .map_err(|e| AppError::Net(e.to_string()))?;
     easy.buffer_size(102400)
         .map_err(|e| AppError::Net(e.to_string()))?;
