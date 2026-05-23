@@ -1,27 +1,22 @@
-CC = musl-gcc
-SYSROOT = $(PWD)/sysroot
+.PHONY: all clean bhpkg
 
-CFLAGS = -Wall -Wextra -O3 -flto -march=native -pipe -fstack-protector-strong \
-         -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security \
-         -Iinclude -I$(SYSROOT)/include -idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu \
-         -MMD -MP -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64
-EXEC = bhpkg
+TARGET = x86_64-unknown-linux-musl
 
-SRC = src/main.c src/graph.c src/net.c src/crypto.c src/archive.c src/db.c src/utils.c src/build.c src/hook.c src/version.c
-OBJ = $(SRC:.c=.o)
-DEP = $(SRC:.c=.d)
+export CC_x86_64_unknown_linux_musl = musl-gcc
+export CXX_x86_64_unknown_linux_musl = musl-g++
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = musl-gcc
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = -C target-feature=+crt-static -C relocation-model=static
+export PKG_CONFIG = /bin/false
+export LIBCURL_NO_PKG_CONFIG = 1
 
-LDFLAGS = -static -flto -L$(SYSROOT)/lib -L$(SYSROOT)/lib64 -larchive -lcurl -lzstd -lssl -lcrypto -lsqlite3 -lz -lpthread
+all: bhpkg
 
-all: $(EXEC)
-
-$(EXEC): $(OBJ)
-	$(CC) $(OBJ) -o $@ $(LDFLAGS)
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+bhpkg:
+	@echo "[*] Building bhpkg via Cargo (Native)..."
+	cargo build --release --target $(TARGET)
+	cp target/$(TARGET)/release/bhpkg ./bhpkg
 
 clean:
-	rm -f src/*.o src/*.d $(EXEC)
-
--include $(DEP)
+	@echo "[*] Cleaning Cargo cache..."
+	cargo clean
+	rm -f bhpkg
