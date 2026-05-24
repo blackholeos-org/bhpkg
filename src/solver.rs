@@ -1,7 +1,7 @@
 use crate::error::{AppError, Result};
 use crate::types::{AppContext, PackageRef};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 const ACTIVITY_SCALE: u64 = 1_000_000;
 
@@ -141,11 +141,17 @@ struct Clause {
     lbd: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WatchEntry {
+    clause_idx: usize,
+    blocker: Literal,
+}
+
 pub struct SatSolver {
     num_vars: usize,
     var_data: Vec<VarData>,
     clauses: Vec<Clause>,
-    watches: Vec<Vec<(usize, usize)>>,
+    watches: Vec<Vec<WatchEntry>>,
     assignment_trail: Vec<Literal>,
     decision_levels: Vec<usize>,
     qhead: usize,
@@ -156,6 +162,7 @@ pub struct SatSolver {
     learned_limit: u64,
     seen_vars: Vec<bool>,
     seen_indices: Vec<usize>,
+    order_heap: BinaryHeap<(u64, usize)>,
 }
 
 fn integer_luby(mut x: usize) -> u64 {
@@ -175,6 +182,11 @@ fn integer_luby(mut x: usize) -> u64 {
 
 impl SatSolver {
     pub fn new(num_vars: usize) -> Self {
+        let mut heap = BinaryHeap::with_capacity(num_vars);
+        for i in 1..=num_vars {
+            heap.push((0, i));
+        }
+
         SatSolver {
             num_vars,
             var_data: vec![VarData::default(); num_vars + 1],
@@ -190,7 +202,18 @@ impl SatSolver {
             learned_limit: 4000,
             seen_vars: vec![false; num_vars + 1],
             seen_indices: Vec::with_capacity(128),
+            order_heap: heap,
         }
+    }
+
+    pub fn new_var(&mut self) -> usize {
+        self.num_vars += 1;
+        self.var_data.push(VarData::default());
+        self.watches.push(Vec::new());
+        self.watches.push(Vec::new());
+        self.seen_vars.push(false);
+        self.order_heap.push((0, self.num_vars));
+        self.num_vars
     }
 
     #[inline(always)]
@@ -242,21 +265,14 @@ impl SatSolver {
         literals.dedup();
 
         let mut filtered_lits = Vec::with_capacity(literals.len());
-        let mut satisfied = false;
         for &lit in literals.iter() {
             match self.get_lit_value(lit) {
-                Assignment::True => {
-                    satisfied = true;
-                    break;
-                }
+                Assignment::True => return Ok(()),
                 Assignment::False => {}
                 Assignment::Unassigned => filtered_lits.push(lit),
             }
         }
 
-        if satisfied {
-            return Ok(());
-        }
         if filtered_lits.is_empty() {
             return Err(AppError::Solver(
                 "Conflict at base level (Unsatisfiable Graph)".into(),
@@ -264,6 +280,9 @@ impl SatSolver {
         }
 
         let clause_idx = self.clauses.len();
+        let watch0 = filtered_lits.get(0).copied().unwrap_or(0);
+        let watch1 = filtered_lits.get(1).copied().unwrap_or(0);
+
         self.clauses.push(Clause {
             literals: filtered_lits.clone(),
             activity: if is_learned { self.clause_inc } else { 0 },
@@ -278,8 +297,14 @@ impl SatSolver {
                 self.decision_levels.len(),
             );
         } else if filtered_lits.len() >= 2 {
-            self.watches[Self::lit_to_idx(filtered_lits[0])].push((clause_idx, 0));
-            self.watches[Self::lit_to_idx(filtered_lits[1])].push((clause_idx, 1));
+            self.watches[Self::lit_to_idx(watch0)].push(WatchEntry {
+                clause_idx,
+                blocker: watch1,
+            });
+            self.watches[Self::lit_to_idx(watch1)].push(WatchEntry {
+                clause_idx,
+                blocker: watch0,
+            });
         }
         Ok(())
     }
@@ -288,58 +313,70 @@ impl SatSolver {
         while self.qhead < self.assignment_trail.len() {
             let p = self.assignment_trail[self.qhead];
             self.qhead += 1;
-            let not_p = -p;
-            let watches_for_not_p_idx = Self::lit_to_idx(not_p);
-            let mut clauses_to_process = std::mem::take(&mut self.watches[watches_for_not_p_idx]);
-            let mut new_watches = Vec::with_capacity(clauses_to_process.len());
+            let false_lit = -p;
+            let watch_idx = Self::lit_to_idx(false_lit);
 
-            for (clause_idx, watched_lit_pos) in clauses_to_process.drain(..) {
-                let other_watched_lit_pos = if watched_lit_pos == 0 { 1 } else { 0 };
-                let other_watched_lit = self.clauses[clause_idx].literals[other_watched_lit_pos];
+            let mut i = 0;
+            while i < self.watches[watch_idx].len() {
+                let entry = self.watches[watch_idx][i];
 
-                if self.get_lit_value(other_watched_lit) == Assignment::True {
-                    new_watches.push((clause_idx, watched_lit_pos));
+                if self.get_lit_value(entry.blocker) == Assignment::True {
+                    i += 1;
                     continue;
                 }
 
-                let mut found_new_watch = false;
-                let mut new_watched_lit = 0;
-                let mut new_watched_pos = 0;
+                let mut first_lit = self.clauses[entry.clause_idx].literals[0];
+                let mut second_lit = self.clauses[entry.clause_idx].literals[1];
 
-                for (i, &lit) in self.clauses[clause_idx].literals.iter().enumerate() {
-                    if i == watched_lit_pos || i == other_watched_lit_pos {
-                        continue;
-                    }
+                if first_lit == false_lit {
+                    self.clauses[entry.clause_idx].literals.swap(0, 1);
+                    std::mem::swap(&mut first_lit, &mut second_lit);
+                }
+
+                if self.get_lit_value(first_lit) == Assignment::True {
+                    self.watches[watch_idx][i].blocker = first_lit;
+                    i += 1;
+                    continue;
+                }
+
+                let mut found = false;
+                let mut new_watch = 0;
+                let mut new_watch_idx = 0;
+
+                let num_literals = self.clauses[entry.clause_idx].literals.len();
+                for k in 2..num_literals {
+                    let lit = self.clauses[entry.clause_idx].literals[k];
                     if self.get_lit_value(lit) != Assignment::False {
-                        found_new_watch = true;
-                        new_watched_lit = lit;
-                        new_watched_pos = i;
+                        new_watch = lit;
+                        new_watch_idx = k;
+                        found = true;
                         break;
                     }
                 }
 
-                if found_new_watch {
-                    let clause = &mut self.clauses[clause_idx];
-                    clause.literals[watched_lit_pos] = new_watched_lit;
-                    clause.literals[new_watched_pos] = not_p;
-                    self.watches[Self::lit_to_idx(new_watched_lit)]
-                        .push((clause_idx, watched_lit_pos));
+                if found {
+                    let clause = &mut self.clauses[entry.clause_idx];
+                    clause.literals[new_watch_idx] = false_lit;
+                    clause.literals[1] = new_watch;
+
+                    self.watches[Self::lit_to_idx(new_watch)].push(WatchEntry {
+                        clause_idx: entry.clause_idx,
+                        blocker: first_lit,
+                    });
+                    self.watches[watch_idx].swap_remove(i);
                 } else {
-                    new_watches.push((clause_idx, watched_lit_pos));
-                    match self.get_lit_value(other_watched_lit) {
-                        Assignment::Unassigned => {
-                            let dl = self.decision_levels.len();
-                            self.assign_literal(other_watched_lit, Some(clause_idx), dl);
-                        }
-                        Assignment::False => {
-                            self.watches[watches_for_not_p_idx] = new_watches;
-                            return Some(clause_idx);
-                        }
-                        Assignment::True => {}
+                    if self.get_lit_value(first_lit) == Assignment::False {
+                        return Some(entry.clause_idx);
+                    } else {
+                        self.assign_literal(
+                            first_lit,
+                            Some(entry.clause_idx),
+                            self.decision_levels.len(),
+                        );
+                        i += 1;
                     }
                 }
             }
-            self.watches[watches_for_not_p_idx] = new_watches;
         }
         None
     }
@@ -355,6 +392,8 @@ impl SatSolver {
             self.var_data[var].assignment = Assignment::Unassigned;
             self.var_data[var].decision_level = 0;
             self.var_data[var].reason_clause_idx = None;
+
+            self.order_heap.push((self.var_data[var].activity, var));
             self.assignment_trail.pop();
         }
         self.qhead = self.assignment_trail.len();
@@ -378,6 +417,8 @@ impl SatSolver {
                     self.seen_vars[var] = true;
                     self.seen_indices.push(var);
                     self.var_data[var].activity += self.var_inc;
+                    self.order_heap.push((self.var_data[var].activity, var));
+
                     if self.var_data[var].decision_level == current_dl {
                         path_c += 1;
                     } else {
@@ -472,8 +513,14 @@ impl SatSolver {
         }
         for (i, c) in self.clauses.iter().enumerate() {
             if c.literals.len() >= 2 {
-                self.watches[Self::lit_to_idx(c.literals[0])].push((i, 0));
-                self.watches[Self::lit_to_idx(c.literals[1])].push((i, 1));
+                self.watches[Self::lit_to_idx(c.literals[0])].push(WatchEntry {
+                    clause_idx: i,
+                    blocker: c.literals[1],
+                });
+                self.watches[Self::lit_to_idx(c.literals[1])].push(WatchEntry {
+                    clause_idx: i,
+                    blocker: c.literals[0],
+                });
             }
         }
 
@@ -495,7 +542,7 @@ impl SatSolver {
             if let Some(conflict_clause_idx) = self.propagate() {
                 if self.decision_levels.is_empty() {
                     return Err(AppError::Solver(
-                        "UNSAT: Dependency constraints inherently conflicting".into(),
+                        "UNSAT: Constraints inherently conflicting".into(),
                     ));
                 }
 
@@ -520,14 +567,24 @@ impl SatSolver {
                 }
 
                 let mut best_var = 0;
-                let mut max_act = 0;
-                let mut act_set = false;
-                for i in 1..=self.num_vars {
-                    if self.get_var_assignment(i) == Assignment::Unassigned {
-                        if !act_set || self.var_data[i].activity > max_act {
-                            max_act = self.var_data[i].activity;
+                while let Some(&(act, var)) = self.order_heap.peek() {
+                    if self.get_var_assignment(var) != Assignment::Unassigned {
+                        self.order_heap.pop();
+                        continue;
+                    }
+                    if act == self.var_data[var].activity {
+                        best_var = var;
+                        break;
+                    } else {
+                        self.order_heap.pop();
+                    }
+                }
+
+                if best_var == 0 {
+                    for i in 1..=self.num_vars {
+                        if self.get_var_assignment(i) == Assignment::Unassigned {
                             best_var = i;
-                            act_set = true;
+                            break;
                         }
                     }
                 }
@@ -669,7 +726,6 @@ fn tarjan_topological_sort(assignment: &[PackageRef], ctx: &AppContext) -> Vec<P
     }
 
     let mut order = Vec::with_capacity(count);
-
     for scc in sccs.into_iter() {
         if scc.len() > 1 {
             let cycle_names: Vec<&str> = scc
@@ -776,14 +832,38 @@ pub fn resolve_dependencies(
     solver.decision_levels.push(0);
 
     for var_indices in name_to_versions.values() {
-        for i in 0..var_indices.len() {
-            for j in (i + 1)..var_indices.len() {
-                solver.add_clause(
-                    vec![-(var_indices[i] as Literal), -(var_indices[j] as Literal)],
-                    false,
-                    0,
-                )?;
+        let n = var_indices.len();
+        if n <= 1 {
+            continue;
+        }
+        if n <= 4 {
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    solver.add_clause(
+                        vec![
+                            -((var_indices[i]) as Literal),
+                            -((var_indices[j]) as Literal),
+                        ],
+                        false,
+                        0,
+                    )?;
+                }
             }
+        } else {
+            let mut s_vars = Vec::with_capacity(n - 1);
+            for _ in 0..(n - 1) {
+                s_vars.push(solver.new_var() as Literal);
+            }
+
+            let x = |i: usize| var_indices[i] as Literal;
+
+            solver.add_clause(vec![-x(0), s_vars[0]], false, 0)?;
+            for i in 1..(n - 1) {
+                solver.add_clause(vec![-x(i), s_vars[i]], false, 0)?;
+                solver.add_clause(vec![-s_vars[i - 1], s_vars[i]], false, 0)?;
+                solver.add_clause(vec![-x(i), -s_vars[i - 1]], false, 0)?;
+            }
+            solver.add_clause(vec![-x(n - 1), -s_vars[n - 2]], false, 0)?;
         }
     }
 

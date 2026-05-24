@@ -7,8 +7,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 fn hex_encode_path(p: &Path) -> String {
     p.as_os_str()
@@ -46,7 +47,6 @@ fn write_metadata_file(pkg: &Package, dest: &Path) -> Result<()> {
 
 fn check_symlink_escape(host_target: &Path, root_dir: &Path) -> Result<()> {
     let mut resolved = root_dir.to_path_buf();
-
     let rel_target = host_target.strip_prefix(root_dir).unwrap_or(host_target);
 
     for comp in rel_target.components() {
@@ -228,13 +228,22 @@ fn build_package(pkg: &mut Package, ctx: &AppContext) -> Result<()> {
     fs::set_permissions(&builddir, fs::Permissions::from_mode(0o755))?;
     fs::set_permissions(&fakeroot, fs::Permissions::from_mode(0o755))?;
 
+    utils::chown_recursive(&builddir, 65534, 65534)?;
+    utils::chown_recursive(&fakeroot, 65534, 65534)?;
+
     for i in 0..pkg.sources.len() {
         let host_src = ctx.root_path(&format!(
             "var/lib/bhpkg/tmp/{}-{}-{}.src",
             pkg.name, pkg.version, i
         ));
         let staged = builddir.join(format!("{}-{}-{}.src", pkg.name, pkg.version, i));
-        let orig = pkg.sources[i].to_lowercase();
+        let orig = pkg.sources[i]
+            .split('|')
+            .next()
+            .unwrap_or(&pkg.sources[i])
+            .trim()
+            .trim_end_matches('/')
+            .to_lowercase();
 
         if orig.ends_with(".tar")
             || orig.ends_with(".tgz")
@@ -252,19 +261,22 @@ fn build_package(pkg: &mut Package, ctx: &AppContext) -> Result<()> {
             if orig.ends_with(".tar.zst") {
                 archive::extract(&host_src, dest, 1, ctx)?;
             } else {
+                let file = File::open(&host_src)?;
                 let status = std::process::Command::new("/bin/busybox")
                     .arg("tar")
                     .arg("xf")
-                    .arg(&host_src)
-                    .arg("-C")
-                    .arg(dest)
+                    .arg("-")
                     .arg("--strip-components=1")
+                    .current_dir(dest)
+                    .uid(65534)
+                    .gid(65534)
+                    .stdin(file)
                     .status()?;
 
                 if !status.success() {
                     return Err(AppError::General(format!(
-                        "tar extraction failed: {}",
-                        host_src.display()
+                        "tar extraction failed for: {}",
+                        pkg.name
                     )));
                 }
             }
@@ -272,6 +284,9 @@ fn build_package(pkg: &mut Package, ctx: &AppContext) -> Result<()> {
             utils::secure_copy(&host_src, &staged, 0o644)?;
         }
     }
+
+    utils::chown_recursive(&builddir, 65534, 65534)?;
+    utils::chown_recursive(&fakeroot, 65534, 65534)?;
 
     let script_path = builddir.join("bh-build.sh");
     let mut f = File::create(&script_path)?;
@@ -313,9 +328,6 @@ fn build_package(pkg: &mut Package, ctx: &AppContext) -> Result<()> {
 
     f.sync_all()?;
     drop(f);
-
-    utils::chown_recursive(&builddir, 65534, 65534)?;
-    utils::chown_recursive(&fakeroot, 65534, 65534)?;
 
     ctx.print_msg(&format!(
         "Building {} in sandboxed environment...",
@@ -787,62 +799,60 @@ pub fn process_build_queue(
         let ctx_clone = ctx.clone();
         let pkgs = Arc::clone(&packages_arc);
 
-        workers.push(std::thread::spawn(move || {
-            loop {
-                let task_idx = {
-                    let (lock, cvar) = &*graph_clone;
-                    let mut g = lock.lock().unwrap();
-                    loop {
-                        if g.failed || ctx_clone.is_interrupted() {
-                            return;
-                        }
-                        if g.completed_count == g.total_tasks {
-                            return;
-                        }
-
-                        if let Some(idx) = g.ready_queue.pop_front() {
-                            g.state[idx] = TaskState::Building;
-                            g.building_count += 1;
-                            break idx;
-                        }
-
-                        if g.building_count == 0 {
-                            g.failed = true;
-                            let _ = tx_clone.send(Msg::BuildFailed(
-                                0,
-                                "Deadlock detected in execution graph".into(),
-                            ));
-                            return;
-                        }
-                        g = cvar.wait(g).unwrap();
+        workers.push(std::thread::spawn(move || loop {
+            let task_idx = {
+                let (lock, cvar) = &*graph_clone;
+                let mut g = lock.lock().unwrap();
+                loop {
+                    if g.failed || ctx_clone.is_interrupted() {
+                        return;
                     }
-                };
+                    if g.completed_count == g.total_tasks {
+                        return;
+                    }
 
-                let mut pkg = pkgs[task_idx].clone();
-                let mut success = true;
+                    if let Some(idx) = g.ready_queue.pop_front() {
+                        g.state[idx] = TaskState::Building;
+                        g.building_count += 1;
+                        break idx;
+                    }
 
-                if !pkg.is_installed {
-                    pkg.is_cached = ctx_clone
-                        .root_path(&format!(
-                            "var/cache/bhpkg/{}-{}.tar.zst",
-                            pkg.name, pkg.version
-                        ))
-                        .exists();
+                    if g.building_count == 0 {
+                        g.failed = true;
+                        let _ = tx_clone.send(Msg::BuildFailed(
+                            0,
+                            "Deadlock detected in execution graph".into(),
+                        ));
+                        return;
+                    }
+                    g = cvar.wait(g).unwrap();
+                }
+            };
 
-                    if !pkg.is_cached {
-                        if let Err(e) = build_package(&mut pkg, &ctx_clone) {
-                            let _ = tx_clone.send(Msg::BuildFailed(
-                                task_idx,
-                                format!("Build failed for {}: {}", pkg.name, e),
-                            ));
-                            success = false;
-                        }
+            let mut pkg = pkgs[task_idx].clone();
+            let mut success = true;
+
+            if !pkg.is_installed {
+                pkg.is_cached = ctx_clone
+                    .root_path(&format!(
+                        "var/cache/bhpkg/{}-{}.tar.zst",
+                        pkg.name, pkg.version
+                    ))
+                    .exists();
+
+                if !pkg.is_cached {
+                    if let Err(e) = build_package(&mut pkg, &ctx_clone) {
+                        let _ = tx_clone.send(Msg::BuildFailed(
+                            task_idx,
+                            format!("Build failed for {}: {}", pkg.name, e),
+                        ));
+                        success = false;
                     }
                 }
+            }
 
-                if success {
-                    let _ = tx_clone.send(Msg::BuildComplete(task_idx, pkg));
-                }
+            if success {
+                let _ = tx_clone.send(Msg::BuildComplete(task_idx, pkg));
             }
         }));
     }

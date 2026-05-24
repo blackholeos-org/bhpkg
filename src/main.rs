@@ -79,9 +79,10 @@ fn bootstrap_filesystem(ctx: &AppContext) -> Result<()> {
         let _ = fs::create_dir_all(ctx.root_path(dir));
     }
     use std::os::unix::fs::PermissionsExt;
+
     fs::set_permissions(
         ctx.root_path("var/lib/bhpkg/tmp"),
-        fs::Permissions::from_mode(0o700),
+        fs::Permissions::from_mode(0o711),
     )?;
     Ok(())
 }

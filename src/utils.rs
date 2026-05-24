@@ -1,6 +1,7 @@
 use crate::error::{AppError, Result};
 use crate::types::AppContext;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
@@ -31,10 +32,9 @@ pub fn zero_copy_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     options.custom_flags(libc::O_NOFOLLOW);
 
-    let mut out_file = options.open(dst)?;
+    let out_file = options.open(dst)?;
     let mut in_file = fs::File::open(src)?;
 
-    use std::os::unix::fs::PermissionsExt;
     out_file.set_permissions(fs::Permissions::from_mode(mode))?;
 
     use std::os::unix::io::AsRawFd;
@@ -43,6 +43,7 @@ pub fn zero_copy_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
 
     unsafe {
         libc::posix_fadvise(fd_in, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        libc::posix_fadvise(fd_in, 0, 0, libc::POSIX_FADV_WILLNEED);
     }
 
     #[cfg(target_os = "linux")]
@@ -63,7 +64,6 @@ pub fn zero_copy_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
             let ret = unsafe {
                 libc::copy_file_range(fd_in, &mut offset_in, fd_out, &mut offset_out, remaining, 0)
             };
-
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 let raw = err.raw_os_error();
@@ -87,20 +87,18 @@ pub fn zero_copy_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
 
     use std::io::{Seek, SeekFrom};
     in_file.seek(SeekFrom::Start(0))?;
-    out_file.seek(SeekFrom::Start(0))?;
-    std::io::copy(&mut in_file, &mut out_file)?;
+    let mut out_write = out_file;
+    std::io::copy(&mut in_file, &mut out_write)?;
 
     Ok(())
 }
 
 pub fn rename_or_copy(src: &Path, dst: &Path, mode: u32) -> Result<()> {
     let _ = fs::remove_file(dst);
-
     if fs::rename(src, dst).is_err() {
         zero_copy_file(src, dst, mode)?;
         let _ = fs::remove_file(src);
     } else {
-        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dst, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
@@ -119,11 +117,16 @@ pub fn chown_recursive(path: &Path, uid: u32, gid: u32) -> Result<()> {
                 let meta = fs::symlink_metadata(&p)?;
                 if meta.is_dir() {
                     walk.push(p.clone());
+                } else if meta.is_file() {
+                    let mode = meta.permissions().mode();
+                    if mode & 0o6000 != 0 {
+                        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(mode & !0o6000));
+                    }
                 }
-                std::os::unix::fs::lchown(&p, Some(uid), Some(gid))?;
+                let _ = std::os::unix::fs::lchown(&p, Some(uid), Some(gid));
             }
         }
     }
-    std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
+    let _ = std::os::unix::fs::lchown(path, Some(uid), Some(gid));
     Ok(())
 }

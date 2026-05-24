@@ -1,6 +1,7 @@
 use crate::error::{AppError, Result};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use memmap2::Mmap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 #[inline(always)]
@@ -21,85 +22,55 @@ fn offin(buf: &[u8]) -> Result<i64> {
 }
 
 pub fn apply_binary_delta(old_file: &Path, patch_file: &Path, new_file: &Path) -> Result<()> {
-    let mut f_patch = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(patch_file)?;
+    let f_old = File::open(old_file)?;
+    let f_patch = File::open(patch_file)?;
 
-    let mut header = [0u8; 32];
-    f_patch.read_exact(&mut header)?;
+    let old_len = f_old.metadata()?.len() as usize;
+    let m_old = if old_len > 0 {
+        Some(unsafe { Mmap::map(&f_old)? })
+    } else {
+        None
+    };
+    let m_patch = unsafe { Mmap::map(&f_patch)? };
 
-    if &header[0..8] != b"BSDIFF40" {
+    if m_patch.len() < 32 || &m_patch[0..8] != b"BSDIFF40" {
         return Err(AppError::General("Invalid BSDIFF40 header".into()));
     }
 
-    let ctrl_len_raw = offin(&header[8..16])?;
-    let diff_len_raw = offin(&header[16..24])?;
-    let new_size_raw = offin(&header[24..32])?;
+    let ctrl_len = offin(&m_patch[8..16])? as usize;
+    let diff_len = offin(&m_patch[16..24])? as usize;
+    let new_size = offin(&m_patch[24..32])? as usize;
 
-    let ctrl_len =
-        u64::try_from(ctrl_len_raw).map_err(|_| AppError::Security("Negative ctrl_len".into()))?;
-    let diff_len =
-        u64::try_from(diff_len_raw).map_err(|_| AppError::Security("Negative diff_len".into()))?;
-    let new_size =
-        u64::try_from(new_size_raw).map_err(|_| AppError::Security("Negative new_size".into()))?;
-
-    let total_patch_size = f_patch.metadata()?.len();
-
-    let min_req_size = 32u64
+    let min_req_size = 32usize
         .checked_add(ctrl_len)
         .and_then(|x| x.checked_add(diff_len))
         .ok_or_else(|| AppError::Security("Delta lengths overflow".into()))?;
 
-    if min_req_size > total_patch_size {
+    if min_req_size > m_patch.len() {
         return Err(AppError::Security(
             "Corrupt patch metadata (Lengths exceed file size)".into(),
         ));
     }
 
-    let mut ctrl_reader = BufReader::with_capacity(131_072, std::fs::File::open(patch_file)?);
-    ctrl_reader.seek(SeekFrom::Start(32))?;
-
-    let mut diff_reader = BufReader::with_capacity(524_288, std::fs::File::open(patch_file)?);
-    diff_reader.seek(SeekFrom::Start(32 + ctrl_len))?;
-
-    let mut extra_reader = BufReader::with_capacity(524_288, std::fs::File::open(patch_file)?);
-    extra_reader.seek(SeekFrom::Start(32 + ctrl_len + diff_len))?;
-
-    let mut f_old = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(old_file)?;
-    let old_len = f_old.metadata()?.len();
-
-    let f_new_inner = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(new_file)?;
-    let mut f_new = BufWriter::with_capacity(1024 * 1024, f_new_inner);
+    let f_new_inner = File::create(new_file)?;
+    f_new_inner.set_len(new_size as u64)?;
+    let mut f_new = BufWriter::with_capacity(2 * 1024 * 1024, f_new_inner);
 
     let mut old_pos: i64 = 0;
-    let mut new_pos: u64 = 0;
-    let mut ctrl_buf = [0u8; 24];
-    const CHUNK_SIZE: usize = 2 * 1024 * 1024;
-    let mut diff_buf = vec![0u8; CHUNK_SIZE];
-    let mut old_buf = vec![0u8; CHUNK_SIZE];
+    let mut new_pos: usize = 0;
+
+    let mut ctrl_ptr = 32;
+    let mut diff_ptr = 32 + ctrl_len;
+    let mut extra_ptr = diff_ptr + diff_len;
 
     while new_pos < new_size {
-        ctrl_reader.read_exact(&mut ctrl_buf)?;
-        let ctrl_add_raw = offin(&ctrl_buf[0..8])?;
-        let ctrl_copy_raw = offin(&ctrl_buf[8..16])?;
-        let ctrl_seek = offin(&ctrl_buf[16..24])?;
-
-        let ctrl_add = u64::try_from(ctrl_add_raw)
-            .map_err(|_| AppError::Security("Negative add len".into()))?;
-        let ctrl_copy = u64::try_from(ctrl_copy_raw)
-            .map_err(|_| AppError::Security("Negative copy len".into()))?;
+        let add_len = offin(&m_patch[ctrl_ptr..ctrl_ptr + 8])? as usize;
+        let copy_len = offin(&m_patch[ctrl_ptr + 8..ctrl_ptr + 16])? as usize;
+        let seek_val = offin(&m_patch[ctrl_ptr + 16..ctrl_ptr + 24])?;
+        ctrl_ptr += 24;
 
         if new_pos
-            .checked_add(ctrl_add)
+            .checked_add(add_len)
             .ok_or_else(|| AppError::Security("Delta Overflow".into()))?
             > new_size
         {
@@ -108,39 +79,31 @@ pub fn apply_binary_delta(old_file: &Path, patch_file: &Path, new_file: &Path) -
             ));
         }
 
-        let mut remaining_add = ctrl_add as usize;
-        while remaining_add > 0 {
-            let chunk = std::cmp::min(remaining_add, CHUNK_SIZE);
-            diff_reader.read_exact(&mut diff_buf[..chunk])?;
-
-            if old_pos >= 0 && (old_pos as u64) < old_len {
-                f_old.seek(SeekFrom::Start(old_pos as u64))?;
-                let available = (old_len - old_pos as u64) as usize;
-                let to_read = std::cmp::min(chunk, available);
-
-                f_old.read_exact(&mut old_buf[..to_read])?;
-                if to_read < chunk {
-                    old_buf[to_read..chunk].fill(0);
+        if add_len > 0 {
+            let mut buffer = vec![0u8; add_len];
+            if let Some(ref m_old_data) = m_old {
+                for i in 0..add_len {
+                    let old_idx = (old_pos + i as i64) as usize;
+                    let old_byte = if old_idx < old_len {
+                        m_old_data[old_idx]
+                    } else {
+                        0
+                    };
+                    buffer[i] = m_patch[diff_ptr + i].wrapping_add(old_byte);
                 }
             } else {
-                old_buf[..chunk].fill(0);
+                for i in 0..add_len {
+                    buffer[i] = m_patch[diff_ptr + i];
+                }
             }
-
-            for i in 0..chunk {
-                diff_buf[i] = diff_buf[i].wrapping_add(old_buf[i]);
-            }
-
-            f_new.write_all(&diff_buf[..chunk])?;
-            remaining_add -= chunk;
-
-            old_pos = old_pos
-                .checked_add(chunk as i64)
-                .ok_or_else(|| AppError::Security("Overflow".into()))?;
-            new_pos += chunk as u64;
+            f_new.write_all(&buffer)?;
+            diff_ptr += add_len;
+            new_pos += add_len;
+            old_pos += add_len as i64;
         }
 
         if new_pos
-            .checked_add(ctrl_copy)
+            .checked_add(copy_len)
             .ok_or_else(|| AppError::Security("Delta Overflow".into()))?
             > new_size
         {
@@ -149,17 +112,14 @@ pub fn apply_binary_delta(old_file: &Path, patch_file: &Path, new_file: &Path) -
             ));
         }
 
-        let mut remaining_copy = ctrl_copy as usize;
-        while remaining_copy > 0 {
-            let chunk = std::cmp::min(remaining_copy, CHUNK_SIZE);
-            extra_reader.read_exact(&mut diff_buf[..chunk])?;
-            f_new.write_all(&diff_buf[..chunk])?;
-            remaining_copy -= chunk;
-            new_pos += chunk as u64;
+        if copy_len > 0 {
+            f_new.write_all(&m_patch[extra_ptr..extra_ptr + copy_len])?;
+            extra_ptr += copy_len;
+            new_pos += copy_len;
         }
 
         old_pos = old_pos
-            .checked_add(ctrl_seek)
+            .checked_add(seek_val)
             .ok_or_else(|| AppError::Security("Seek Overflow".into()))?;
     }
 

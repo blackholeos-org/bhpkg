@@ -115,6 +115,12 @@ fn create_easy(
     easy.ssl_verify_host(true)
         .map_err(|e| AppError::Net(e.to_string()))?;
 
+    let ca_path = std::path::Path::new("/etc/ssl/certs/ca-certificates.crt");
+    if ca_path.exists() {
+        easy.cainfo(ca_path)
+            .map_err(|e| AppError::Net(e.to_string()))?;
+    }
+
     easy.useragent("bhpkg/2.0 (Blackhole OS)")
         .map_err(|e| AppError::Net(e.to_string()))?;
     easy.buffer_size(102400)
@@ -310,17 +316,33 @@ pub fn download_all(packages: &[Package], ctx: &AppContext) -> Result<()> {
         for (token, result) in done_tokens {
             if let Some(mut active) = active_transfers.remove(&token) {
                 let mut easy = multi.remove(active.handle).unwrap();
-                let success = result.is_ok() && easy.response_code().unwrap_or(0) / 100 == 2;
+
+                let mut hash_ok = false;
+                let mut err_msg = String::new();
+                let mut http_code = 0;
+
+                let success = match result {
+                    Ok(_) => {
+                        http_code = easy.response_code().unwrap_or(0);
+                        http_code / 100 == 2
+                    }
+                    Err(e) => {
+                        err_msg = format!("TLS/Network Error: {}", e);
+                        false
+                    }
+                };
 
                 drop(easy);
 
-                let mut hash_ok = false;
                 if success {
                     if let Some(ref hash) = active.task.expected_hash {
                         if !hash.is_empty() {
                             hash_ok = crypto::verify_sha256(&active.task.dest, hash);
+                            if !hash_ok {
+                                err_msg = "SHA256 mismatch".into();
+                            }
                         } else {
-                            hash_ok = false;
+                            err_msg = "Expected hash is empty".into();
                         }
                     } else {
                         let file_name = active.task.dest.to_string_lossy();
@@ -330,9 +352,11 @@ pub fn download_all(packages: &[Package], ctx: &AppContext) -> Result<()> {
                         {
                             hash_ok = true;
                         } else {
-                            hash_ok = false;
+                            err_msg = "No hash provided for package".into();
                         }
                     }
+                } else if err_msg.is_empty() {
+                    err_msg = format!("HTTP {}", http_code);
                 }
 
                 if success && hash_ok {
@@ -345,7 +369,9 @@ pub fn download_all(packages: &[Package], ctx: &AppContext) -> Result<()> {
 
                     if active.task.current_mirror < active.task.mirrors.len() {
                         ctx.print_warn(&format!(
-                            "Hash mismatch or offline. Falling back to: {}",
+                            "[{}] {} - Falling back to: {}",
+                            active.task.name,
+                            err_msg,
                             active.task.mirrors[active.task.current_mirror]
                         ));
 
@@ -372,8 +398,8 @@ pub fn download_all(packages: &[Package], ctx: &AppContext) -> Result<()> {
                         }
                     } else {
                         ctx.print_err(&format!(
-                            "All mirrors exhausted or failed integrity for '{}'",
-                            active.task.name
+                            "All mirrors exhausted for '{}' (Last error: {})",
+                            active.task.name, err_msg
                         ));
                         overall_success = false;
                     }

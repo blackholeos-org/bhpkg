@@ -1,17 +1,14 @@
 use crate::error::{AppError, Result};
 use crate::types::AppContext;
-use nix::mount::{MntFlags, MsFlags, mount, umount2};
-use nix::sched::{CloneFlags, unshare};
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::sched::{unshare, CloneFlags};
 use nix::unistd::chdir;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio, exit};
-
-// fuck this shit
-// one week staring at this to get it working. And it works - Fuck yeah!
+use std::process::{exit, Command, Stdio};
 
 fn apply_seccomp_whitelist() -> Result<()> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
@@ -329,7 +326,7 @@ pub fn execute_internal_sandbox() -> Result<()> {
         sandbox_root.as_str(),
         Some("tmpfs"),
         MsFlags::empty(),
-        Some("size=2G,mode=755"),
+        Some("size=6G,mode=755"),
     )
     .map_err(|e| {
         AppError::Io(std::io::Error::new(
